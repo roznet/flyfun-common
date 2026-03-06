@@ -258,13 +258,21 @@ def create_auth_router(
 
         Returns a flyfun JWT token for the app to use in subsequent requests.
         """
-        # Determine the expected audience (App ID for iOS, may differ from
-        # the Services ID used for web OAuth)
-        expected_audience = os.environ.get(
-            "APPLE_APP_ID",
-            os.environ.get("APPLE_CLIENT_ID", ""),
-        )
-        if not expected_audience:
+        # Build the list of accepted audiences.
+        # APPLE_APP_IDS: comma-separated bundle IDs for all iOS apps
+        #   e.g. "aero.flyfun.weather,aero.flyfun.customs"
+        # Falls back to APPLE_APP_ID (single app) or APPLE_CLIENT_ID (web).
+        app_ids_raw = os.environ.get("APPLE_APP_IDS", "")
+        if app_ids_raw:
+            expected_audiences = [a.strip() for a in app_ids_raw.split(",") if a.strip()]
+        else:
+            single = os.environ.get(
+                "APPLE_APP_ID",
+                os.environ.get("APPLE_CLIENT_ID", ""),
+            )
+            expected_audiences = [single] if single else []
+
+        if not expected_audiences:
             raise HTTPException(
                 status_code=503,
                 detail="Apple Sign In is not configured on this server",
@@ -274,11 +282,13 @@ def create_auth_router(
             jwks_client = _get_apple_jwks_client()
             signing_key = jwks_client.get_signing_key_from_jwt(body.identity_token)
 
+            # PyJWT accepts a list of audiences — token is valid if its
+            # aud matches ANY of them.
             claims = pyjwt.decode(
                 body.identity_token,
                 signing_key.key,
                 algorithms=["RS256"],
-                audience=expected_audience,
+                audience=expected_audiences,
                 issuer="https://appleid.apple.com",
             )
         except pyjwt.ExpiredSignatureError:
