@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from flyfun_common.db.models import Base, UserRow
+from flyfun_common.db.models import Base, UserPreferencesRow, UserRow
 
 logger = logging.getLogger(__name__)
 
@@ -94,5 +94,7 @@ def ensure_dev_user(session: Session) -> None:
             approved=True,
         )
         session.add(user)
+        session.flush()
+        session.add(UserPreferencesRow(user_id=DEV_USER_ID))
         session.commit()
         logger.info("Dev user created: %s", DEV_USER_ID)

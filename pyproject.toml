@@ -13,6 +13,7 @@ dependencies = [
     "PyJWT>=2.8",
     "authlib>=1.3",
     "httpx",
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
