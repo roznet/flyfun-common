@@ -22,6 +22,7 @@ from flyfun_common.db.engine import DEV_USER_ID, SessionLocal, is_dev_mode
 from flyfun_common.db.models import ApiTokenRow, UserRow
 
 TOKEN_PREFIX = "ff_"
+_LEGACY_TOKEN_PREFIX = "wb_"  # accept old tokens during migration
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -37,9 +38,14 @@ def get_db() -> Generator[Session, None, None]:
         session.close()
 
 
+def _is_api_token(token: str) -> bool:
+    """Check if a bearer token is an API token (vs a JWT)."""
+    return token.startswith(TOKEN_PREFIX) or token.startswith(_LEGACY_TOKEN_PREFIX)
+
+
 def _authenticate_bearer_token(token: str, db: Session) -> str:
-    """Validate a hashed API token (ff_ prefix) against the api_tokens table."""
-    if not token.startswith(TOKEN_PREFIX):
+    """Validate a hashed API token against the api_tokens table."""
+    if not _is_api_token(token):
         raise HTTPException(status_code=401, detail="Invalid token format")
 
     token_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -89,7 +95,7 @@ def _decode_user_id(request: Request, db: Session) -> str:
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         bearer_token = auth_header[7:]
-        if not bearer_token.startswith(TOKEN_PREFIX):
+        if not _is_api_token(bearer_token):
             try:
                 payload = decode_token(bearer_token, secret)
                 return payload["sub"]
