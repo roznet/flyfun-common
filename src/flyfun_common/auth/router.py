@@ -5,19 +5,23 @@ The callback creates/updates users in the shared DB and sets the
 cross-subdomain JWT cookie.
 
 Supports multiple OAuth providers (Google, Apple, etc.) via generic
-/{provider} routes.
+/{provider} routes.  Also supports native iOS Sign in with Apple via
+POST /auth/apple/token (identity token validation).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import (
@@ -33,6 +37,18 @@ from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import UserRow
 
 logger = logging.getLogger(__name__)
+
+# Apple's JWKS endpoint for verifying identity tokens
+_APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+_apple_jwks_client: pyjwt.PyJWKClient | None = None
+
+
+def _get_apple_jwks_client() -> pyjwt.PyJWKClient:
+    """Lazily create a cached JWKS client for Apple's public keys."""
+    global _apple_jwks_client
+    if _apple_jwks_client is None:
+        _apple_jwks_client = pyjwt.PyJWKClient(_APPLE_JWKS_URL, cache_keys=True)
+    return _apple_jwks_client
 
 
 def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
@@ -64,6 +80,63 @@ def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
     if not userinfo:
         raise ValueError(f"No userinfo in token from {provider}")
     return userinfo["sub"], userinfo.get("email", ""), userinfo.get("name", "")
+
+
+def _find_or_create_user(
+    db: Session,
+    provider: str,
+    provider_sub: str,
+    email: str,
+    name: str,
+    on_new_user: callable | None = None,
+    request: Request | None = None,
+) -> UserRow:
+    """Find an existing user by (provider, provider_sub) or create a new one.
+
+    Updates email/name on returning users if changed.
+    """
+    user = (
+        db.query(UserRow)
+        .filter_by(provider=provider, provider_sub=provider_sub)
+        .first()
+    )
+    if user is None:
+        user = UserRow(
+            id=str(uuid.uuid4()),
+            provider=provider,
+            provider_sub=provider_sub,
+            email=email,
+            display_name=name,
+            approved=True,
+        )
+        db.add(user)
+        db.flush()
+        logger.info("New user created via %s: %s (%s)", provider, email, user.id)
+
+        if on_new_user and request:
+            try:
+                on_new_user(user, request, db)
+            except Exception:
+                logger.warning(
+                    "on_new_user callback failed for %s", email, exc_info=True
+                )
+
+    user.last_login_at = datetime.now(timezone.utc)
+    if email and user.email != email:
+        user.email = email
+    # Only update name if we got a real name (not just the email echoed back)
+    if name and name != email and user.display_name != name:
+        user.display_name = name
+    db.flush()
+    return user
+
+
+class AppleTokenRequest(BaseModel):
+    """Request body for native iOS Sign in with Apple."""
+
+    identity_token: str
+    first_name: str | None = None
+    last_name: str | None = None
 
 
 def create_auth_router(
@@ -147,38 +220,10 @@ def create_auth_router(
                 status_code=400, detail=f"No subject identifier from {provider}"
             )
 
-        user = (
-            db.query(UserRow)
-            .filter_by(provider=provider, provider_sub=provider_sub)
-            .first()
+        user = _find_or_create_user(
+            db, provider, provider_sub, email, name,
+            on_new_user=on_new_user, request=request,
         )
-        if user is None:
-            user = UserRow(
-                id=str(uuid.uuid4()),
-                provider=provider,
-                provider_sub=provider_sub,
-                email=email,
-                display_name=name,
-                approved=True,
-            )
-            db.add(user)
-            db.flush()
-            logger.info("New user created via %s: %s (%s)", provider, email, user.id)
-
-            if on_new_user:
-                try:
-                    on_new_user(user, request, db)
-                except Exception:
-                    logger.warning(
-                        "on_new_user callback failed for %s", email, exc_info=True
-                    )
-
-        user.last_login_at = datetime.now(timezone.utc)
-        if email and user.email != email:
-            user.email = email
-        if name and name != email and user.display_name != name:
-            user.display_name = name
-        db.flush()
 
         if not user.approved:
             return RedirectResponse(url="/login.html?status=pending", status_code=302)
@@ -196,6 +241,75 @@ def create_auth_router(
         response = RedirectResponse(url="/", status_code=302)
         _set_session_cookie(response, jwt_token)
         return response
+
+    # --- Native iOS Sign in with Apple ---
+
+    @router.post("/apple/token")
+    async def apple_token(
+        body: AppleTokenRequest,
+        request: Request,
+        db: Session = Depends(get_db),
+    ):
+        """Validate an Apple identity token from a native iOS app.
+
+        The iOS app uses ASAuthorizationAppleIDProvider to get an identity
+        token (JWT signed by Apple), then sends it here. We verify the
+        signature against Apple's public keys and extract the user info.
+
+        Returns a flyfun JWT token for the app to use in subsequent requests.
+        """
+        # Determine the expected audience (App ID for iOS, may differ from
+        # the Services ID used for web OAuth)
+        expected_audience = os.environ.get(
+            "APPLE_APP_ID",
+            os.environ.get("APPLE_CLIENT_ID", ""),
+        )
+        if not expected_audience:
+            raise HTTPException(
+                status_code=503,
+                detail="Apple Sign In is not configured on this server",
+            )
+
+        try:
+            jwks_client = _get_apple_jwks_client()
+            signing_key = jwks_client.get_signing_key_from_jwt(body.identity_token)
+
+            claims = pyjwt.decode(
+                body.identity_token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=expected_audience,
+                issuer="https://appleid.apple.com",
+            )
+        except pyjwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Identity token has expired")
+        except pyjwt.InvalidTokenError as exc:
+            logger.warning("Apple identity token validation failed: %s", exc)
+            raise HTTPException(status_code=401, detail="Invalid identity token")
+
+        sub = claims.get("sub", "")
+        email = claims.get("email", "")
+        if not sub:
+            raise HTTPException(status_code=400, detail="No subject in identity token")
+
+        # Build display name from optional first_name/last_name
+        # (only available on first iOS authorization)
+        name_parts = [p for p in [body.first_name, body.last_name] if p]
+        name = " ".join(name_parts) or email
+
+        user = _find_or_create_user(
+            db, "apple", sub, email, name,
+            on_new_user=on_new_user, request=request,
+        )
+
+        if not user.approved:
+            raise HTTPException(status_code=403, detail="Account is not approved")
+
+        jwt_token = create_token(
+            user.id, user.email, user.display_name, get_jwt_secret()
+        )
+
+        return {"token": jwt_token, "user_id": user.id}
 
     @router.post("/logout")
     async def logout():
