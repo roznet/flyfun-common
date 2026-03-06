@@ -3,13 +3,18 @@
 Each app calls create_auth_router() and mounts it on their FastAPI app.
 The callback creates/updates users in the shared DB and sets the
 cross-subdomain JWT cookie.
+
+Supports multiple OAuth providers (Google, Apple, etc.) via generic
+/{provider} routes.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -17,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import (
     COOKIE_NAME,
+    SUPPORTED_PROVIDERS,
     create_oauth,
     get_cookie_domain,
     get_jwt_secret,
@@ -27,6 +33,37 @@ from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import UserRow
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
+    """Extract (sub, email, display_name) from an OAuth token response.
+
+    Each provider returns user data differently:
+    - Google: standard OIDC userinfo with sub, email, name
+    - Apple: sub/email in id_token claims; name only on first login via
+             a separate 'user' JSON field in the POST body
+    """
+    if provider == "apple":
+        # Apple puts claims in the id_token (parsed by authlib into userinfo)
+        userinfo = token.get("userinfo") or {}
+        sub = userinfo.get("sub", "")
+        email = userinfo.get("email", "")
+        # Apple only sends the user's name on first authorization.
+        # It comes as a JSON blob in the POST body 'user' parameter,
+        # which authlib does NOT parse automatically — we handle it in
+        # the callback and pass it via the token dict.
+        user_data = token.get("_apple_user", {})
+        name_parts = user_data.get("name", {})
+        first = name_parts.get("firstName", "")
+        last = name_parts.get("lastName", "")
+        name = f"{first} {last}".strip() or email
+        return sub, email, name
+
+    # Default: Google and other standard OIDC providers
+    userinfo = token.get("userinfo")
+    if not userinfo:
+        raise ValueError(f"No userinfo in token from {provider}")
+    return userinfo["sub"], userinfo.get("email", ""), userinfo.get("name", "")
 
 
 def create_auth_router(
@@ -41,31 +78,74 @@ def create_auth_router(
     router = APIRouter(prefix="/auth", tags=["auth"])
     oauth = create_oauth()
 
-    @router.get("/login/google")
-    async def login_google(request: Request, platform: str | None = None):
-        redirect_uri = request.url_for("callback_google")
+    def _get_oauth_client(provider: str):
+        """Get a registered OAuth client, or raise 404."""
+        client = getattr(oauth, provider, None)
+        if client is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Auth provider '{provider}' is not configured",
+            )
+        return client
+
+    @router.get("/providers")
+    async def list_providers():
+        """Return the list of configured OAuth providers."""
+        from flyfun_common.auth.config import get_registered_providers
+
+        return {"providers": get_registered_providers(oauth)}
+
+    @router.get("/login/{provider}")
+    async def login(provider: str, request: Request, platform: str | None = None):
+        if provider not in SUPPORTED_PROVIDERS:
+            raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+        client = _get_oauth_client(provider)
+        redirect_uri = request.url_for("callback", provider=provider)
         if not is_dev_mode():
             redirect_uri = str(redirect_uri).replace("http://", "https://")
         if platform:
             request.session["oauth_platform"] = platform
-        return await oauth.google.authorize_redirect(request, redirect_uri)
+        return await client.authorize_redirect(request, redirect_uri)
 
-    @router.get("/callback/google")
-    async def callback_google(request: Request, db: Session = Depends(get_db)):
+    @router.get("/callback/{provider}")
+    @router.post("/callback/{provider}")  # Apple uses form_post (POST)
+    async def callback(
+        provider: str, request: Request, db: Session = Depends(get_db)
+    ):
+        if provider not in SUPPORTED_PROVIDERS:
+            raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+        client = _get_oauth_client(provider)
+
         try:
-            token = await oauth.google.authorize_access_token(request)
+            token = await client.authorize_access_token(request)
         except Exception as exc:
-            logger.warning("OAuth callback failed: %s", exc)
-            raise HTTPException(status_code=400, detail="OAuth authentication failed")
+            logger.warning("OAuth callback failed for %s: %s", provider, exc)
+            raise HTTPException(
+                status_code=400, detail="OAuth authentication failed"
+            )
 
-        userinfo = token.get("userinfo")
-        if not userinfo:
-            raise HTTPException(status_code=400, detail="No user info from Google")
+        # Apple: extract the 'user' JSON from form body (only sent on first auth)
+        if provider == "apple":
+            form = await request.form()
+            user_json = form.get("user")
+            if user_json:
+                try:
+                    token["_apple_user"] = json.loads(user_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
-        provider = "google"
-        provider_sub = userinfo["sub"]
-        email = userinfo.get("email", "")
-        name = userinfo.get("name", email)
+        try:
+            provider_sub, email, name = _extract_userinfo(provider, token)
+        except (ValueError, KeyError) as exc:
+            logger.warning("Failed to extract userinfo from %s: %s", provider, exc)
+            raise HTTPException(
+                status_code=400, detail=f"No user info from {provider}"
+            )
+
+        if not provider_sub:
+            raise HTTPException(
+                status_code=400, detail=f"No subject identifier from {provider}"
+            )
 
         user = (
             db.query(UserRow)
@@ -83,7 +163,7 @@ def create_auth_router(
             )
             db.add(user)
             db.flush()
-            logger.info("New user created: %s (%s)", email, user.id)
+            logger.info("New user created via %s: %s (%s)", provider, email, user.id)
 
             if on_new_user:
                 try:
@@ -96,7 +176,7 @@ def create_auth_router(
         user.last_login_at = datetime.now(timezone.utc)
         if email and user.email != email:
             user.email = email
-        if name and user.display_name != name:
+        if name and name != email and user.display_name != name:
             user.display_name = name
         db.flush()
 
@@ -107,13 +187,10 @@ def create_auth_router(
             user.id, user.email, user.display_name, get_jwt_secret()
         )
 
-        # iOS app: redirect to custom URL scheme
+        # iOS/native app: redirect to custom URL scheme
         platform = request.session.pop("oauth_platform", None)
         if platform == "ios":
-            from urllib.parse import quote
-
-            app_scheme = "flyfun"
-            redirect_url = f"{app_scheme}://auth/callback?token={quote(jwt_token)}"
+            redirect_url = f"flyfun://auth/callback?token={quote(jwt_token)}"
             return RedirectResponse(url=redirect_url, status_code=302)
 
         response = RedirectResponse(url="/", status_code=302)
