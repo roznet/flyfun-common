@@ -1,0 +1,53 @@
+"""Basic tests for shared auth utilities."""
+
+import os
+import pytest
+from flyfun_common.auth.jwt_utils import create_token, decode_token
+from flyfun_common.auth.config import get_jwt_secret
+
+
+def test_jwt_roundtrip():
+    secret = "test-secret"
+    token = create_token("user-123", "test@example.com", "Test User", secret)
+    payload = decode_token(token, secret)
+    assert payload["sub"] == "user-123"
+    assert payload["email"] == "test@example.com"
+    assert payload["name"] == "Test User"
+
+
+def test_jwt_wrong_secret():
+    import jwt
+
+    token = create_token("user-123", "a@b.com", "A", "secret-1")
+    with pytest.raises(jwt.InvalidSignatureError):
+        decode_token(token, "secret-2")
+
+
+def test_dev_mode_secret():
+    os.environ.pop("JWT_SECRET", None)
+    os.environ["ENVIRONMENT"] = "development"
+    secret = get_jwt_secret()
+    assert secret  # should return dev default
+
+
+def test_shared_db_roundtrip(tmp_path):
+    os.environ["ENVIRONMENT"] = "development"
+    os.environ["DATA_DIR"] = str(tmp_path)
+
+    from flyfun_common.db.engine import get_engine, init_shared_db, reset_engine, SessionLocal, ensure_dev_user
+    from flyfun_common.db.models import UserRow
+
+    reset_engine()
+    get_engine()
+    init_shared_db()
+
+    session = SessionLocal()
+    try:
+        ensure_dev_user(session)
+        user = session.get(UserRow, "dev-user-001")
+        assert user is not None
+        assert user.display_name == "Dev User"
+        assert user.approved is True
+    finally:
+        session.close()
+        reset_engine()
