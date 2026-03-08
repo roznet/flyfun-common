@@ -169,7 +169,12 @@ def create_auth_router(
         return {"providers": get_registered_providers(oauth)}
 
     @router.get("/login/{provider}")
-    async def login(provider: str, request: Request, platform: str | None = None):
+    async def login(
+        provider: str,
+        request: Request,
+        platform: str | None = None,
+        scheme: str | None = None,
+    ):
         if provider not in SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
         client = _get_oauth_client(provider)
@@ -178,6 +183,8 @@ def create_auth_router(
             redirect_uri = str(redirect_uri).replace("http://", "https://")
         if platform:
             request.session["oauth_platform"] = platform
+        if scheme:
+            request.session["oauth_scheme"] = scheme
         return await client.authorize_redirect(request, redirect_uri)
 
     @router.get("/callback/{provider}")
@@ -232,10 +239,11 @@ def create_auth_router(
             user.id, user.email, user.display_name, get_jwt_secret()
         )
 
-        # iOS/native app: redirect to custom URL scheme
+        # iOS/native app: redirect to app-specific custom URL scheme
         platform = request.session.pop("oauth_platform", None)
         if platform == "ios":
-            redirect_url = f"flyfun://auth/callback?token={quote(jwt_token)}"
+            scheme = request.session.pop("oauth_scheme", "flyfun")
+            redirect_url = f"{scheme}://auth/callback?token={quote(jwt_token)}"
             return RedirectResponse(url=redirect_url, status_code=302)
 
         response = RedirectResponse(url="/", status_code=302)
