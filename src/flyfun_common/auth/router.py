@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -111,14 +112,14 @@ def _find_or_create_user(
         )
         db.add(user)
         db.flush()
-        logger.info("New user created via %s: %s (%s)", provider, email, user.id)
+        logger.info("New user created via %s: %s", provider, user.id)
 
         if on_new_user and request:
             try:
                 on_new_user(user, request, db)
             except Exception:
                 logger.warning(
-                    "on_new_user callback failed for %s", email, exc_info=True
+                    "on_new_user callback failed for %s", user.id, exc_info=True
                 )
 
     user.last_login_at = datetime.now(timezone.utc)
@@ -184,6 +185,11 @@ def create_auth_router(
         if platform:
             request.session["oauth_platform"] = platform
         if scheme:
+            if not re.fullmatch(r"flyfun[a-z0-9\-]*", scheme):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid URL scheme",
+                )
             request.session["oauth_scheme"] = scheme
         return await client.authorize_redirect(request, redirect_uri)
 

@@ -6,7 +6,23 @@ build-backend = "hatchling.build"
 name = "flyfun-common"
 version = "0.1.0"
 description = "Shared user management and auth for flyfun services"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+authors = [
+    { name = "Brice Rosenzweig", email = "brice@ro-z.net" },
+]
+keywords = ["flyfun", "auth", "oauth", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "fastapi>=0.109",
     "sqlalchemy>=2.0",
@@ -18,3 +34,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "httpx"]
+
+[project.urls]
+Homepage = "https://flyfun.aero"
+Repository = "https://github.com/roznet/flyfun-common"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["tests/", "designs/", ".pytest_cache/"]
+
+[tool.hatch.build.targets.wheel]
+exclude = ["tests/", "designs/"]
