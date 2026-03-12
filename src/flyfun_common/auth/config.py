@@ -106,6 +106,7 @@ def create_oauth() -> OAuth:
             client_id=os.environ.get("APPLE_CLIENT_ID"),
             client_secret=_apple_client_secret(),
             server_metadata_url="https://appleid.apple.com/.well-known/openid-configuration",
+            token_endpoint_auth_method="client_secret_post",
             client_kwargs={
                 "scope": "openid email name",
                 "response_mode": "form_post",
