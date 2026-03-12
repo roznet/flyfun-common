@@ -125,3 +125,23 @@ def current_user_id(
         raise HTTPException(status_code=403, detail="Account suspended")
 
     return user_id
+
+
+def optional_user_id(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> str | None:
+    """Return the authenticated user ID, or None if not authenticated."""
+    try:
+        user_id = _decode_user_id(request, db)
+    except HTTPException:
+        return None
+
+    if is_dev_mode():
+        return user_id
+
+    user = db.query(UserRow).filter(UserRow.id == user_id).first()
+    if not user or not user.approved:
+        return None
+
+    return user_id
