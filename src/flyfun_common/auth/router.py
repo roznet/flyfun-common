@@ -374,6 +374,7 @@ def create_auth_router(
         db.query(UserPreferencesRow).filter(UserPreferencesRow.user_id == user_id).delete()
         db.query(ApiTokenRow).filter(ApiTokenRow.user_id == user_id).delete()
         db.query(UserRow).filter(UserRow.id == user_id).delete()
+        db.commit()
 
         logger.info("Account deleted for user %s", user_id)
 
