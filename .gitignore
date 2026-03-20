@@ -6,3 +6,5 @@ build/
 *.pyc
 data/
 .env
+.venv/
+venv/
