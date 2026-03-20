@@ -71,9 +71,7 @@ class CostLedgerRow(Base):
     __tablename__ = "cost_ledger"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("users.id", ondelete="CASCADE"), index=True
-    )
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
     service: Mapped[str] = mapped_column(String(64))
     action: Mapped[str] = mapped_column(String(64))
     cost: Mapped[float] = mapped_column(Float)

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import jwt as pyjwt
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -359,23 +359,32 @@ def create_auth_router(
         }
 
     @router.delete("/account", status_code=204)
-    def delete_account(
+    async def delete_account(
         user_id: str = Depends(current_user_id), db: Session = Depends(get_db)
     ):
-        """Delete the authenticated user's account and all associated data."""
+        """Delete the authenticated user's account and all associated data.
+
+        The on_delete_user callback is called first so apps can clean up their
+        own data.  If the callback raises, the entire transaction is rolled back
+        (fail-closed: better to block deletion than leave partial state).
+        """
         logger.info("Account deletion requested for user %s", user_id)
 
         # Let the app clean up its own data first
         if on_delete_user:
             on_delete_user(user_id, db)
 
-        # Delete shared tables (cost_ledger rows are kept for audit/reporting)
+        # Delete shared tables (cost_ledger rows are intentionally kept for
+        # audit/reporting — CostLedgerRow has no FK cascade on users)
         db.query(UserPreferencesRow).filter(UserPreferencesRow.user_id == user_id).delete()
         db.query(ApiTokenRow).filter(ApiTokenRow.user_id == user_id).delete()
         db.query(UserRow).filter(UserRow.id == user_id).delete()
-        db.commit()
 
         logger.info("Account deleted for user %s", user_id)
+
+        response = Response(status_code=204)
+        response.delete_cookie(COOKIE_NAME, path="/", domain=get_cookie_domain())
+        return response
 
     return router
 

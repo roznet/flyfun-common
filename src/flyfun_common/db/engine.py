@@ -118,6 +118,11 @@ def find_orphaned_user_ids(db: Session, model: type, user_id_col: str = "user_id
                      (default ``"user_id"``).
     """
     col = getattr(model, user_id_col)
-    subq = db.query(UserRow.id).subquery()
-    rows = db.query(col).distinct().filter(col.notin_(db.query(subq))).all()
+    rows = (
+        db.query(col)
+        .distinct()
+        .outerjoin(UserRow, col == UserRow.id)
+        .filter(UserRow.id.is_(None))
+        .all()
+    )
     return [r[0] for r in rows]

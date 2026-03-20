@@ -169,7 +169,7 @@ def cleanup_orphaned_data():
 
 ## Key Choices
 
-- **No FK constraint on `api_tokens.user_id`**: The column is just `String(64)` with an index, not a `ForeignKey`. This avoids issues with table creation order when shared and app-specific tables use different `Base` classes. Referential integrity is enforced at the application level.
+- **No FK constraint on `api_tokens.user_id` or `cost_ledger.user_id`**: Both are plain `String(64)` with an index, no `ForeignKey`. For `api_tokens` this avoids table creation order issues between shared and app-specific `Base` classes. For `cost_ledger` this ensures rows survive user deletion (audit/reporting data).
 - **`credit_balance` on UserRow**: Kept from flyfun-weather. Apps that don't use credits simply ignore it. Avoids a separate table for a single float.
 - **Single `flyfun.db` in dev**: All apps share one SQLite file locally. Simulates the shared MySQL in production.
 - **`get_db()` auto-commits**: The generator commits on success, rolls back on exception. Endpoints don't need explicit `db.commit()`.

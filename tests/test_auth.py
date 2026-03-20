@@ -91,12 +91,17 @@ def test_find_orphaned_user_ids(tmp_path):
 
 
 def test_delete_account(tmp_path):
-    """DELETE /auth/account removes user and all associated shared data."""
+    """DELETE /auth/account removes user, tokens, prefs and clears cookie."""
     os.environ["ENVIRONMENT"] = "development"
     os.environ["DATA_DIR"] = str(tmp_path)
 
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from starlette.middleware.sessions import SessionMiddleware
+
+    from flyfun_common.auth.router import create_auth_router
     from flyfun_common.db.engine import get_engine, init_shared_db, reset_engine, SessionLocal, ensure_dev_user
-    from flyfun_common.db.models import ApiTokenRow, UserRow
+    from flyfun_common.db.models import ApiTokenRow, CostLedgerRow, UserPreferencesRow, UserRow
 
     reset_engine()
     get_engine()
@@ -106,27 +111,45 @@ def test_delete_account(tmp_path):
     try:
         ensure_dev_user(session)
 
-        # Add an API token for the dev user
-        token = ApiTokenRow(
-            user_id="dev-user-001",
-            token_hash="abc123hash",
-            name="test token",
-        )
-        session.add(token)
+        # Add an API token and a cost ledger entry for the dev user
+        session.add(ApiTokenRow(
+            user_id="dev-user-001", token_hash="abc123hash", name="test token",
+        ))
+        session.add(CostLedgerRow(
+            user_id="dev-user-001", service="test", action="test", cost=1.0,
+        ))
         session.commit()
 
-        # Verify user and token exist
-        assert session.get(UserRow, "dev-user-001") is not None
-        assert session.query(ApiTokenRow).filter_by(user_id="dev-user-001").count() == 1
+        # Track whether on_delete_user callback was invoked
+        callback_calls = []
 
-        # Simulate what the delete endpoint does
-        session.query(ApiTokenRow).filter(ApiTokenRow.user_id == "dev-user-001").delete()
-        session.query(UserRow).filter(UserRow.id == "dev-user-001").delete()
-        session.commit()
+        def on_delete(user_id, db):
+            callback_calls.append(user_id)
 
-        # Verify deletion
+        app = FastAPI()
+        app.add_middleware(SessionMiddleware, secret_key="test")
+        app.include_router(create_auth_router(on_delete_user=on_delete))
+
+        client = TestClient(app)
+        resp = client.delete("/auth/account")
+        assert resp.status_code == 204
+
+        # Cookie should be cleared
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert "flyfun_auth" in set_cookie
+        assert 'Max-Age=0' in set_cookie
+
+        # Callback was invoked
+        assert callback_calls == ["dev-user-001"]
+
+        # Shared data deleted
+        session.expire_all()
         assert session.get(UserRow, "dev-user-001") is None
         assert session.query(ApiTokenRow).filter_by(user_id="dev-user-001").count() == 0
+        assert session.query(UserPreferencesRow).filter_by(user_id="dev-user-001").count() == 0
+
+        # Cost ledger retained for audit
+        assert session.query(CostLedgerRow).filter_by(user_id="dev-user-001").count() == 1
     finally:
         session.close()
         reset_engine()
