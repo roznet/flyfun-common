@@ -12,6 +12,7 @@ from flyfun_common.db.engine import (
     reset_engine,
     init_shared_db,
     ensure_dev_user,
+    find_orphaned_user_ids,
     SessionLocal,
     DEV_USER_ID,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "reset_engine",
     "init_shared_db",
     "ensure_dev_user",
+    "find_orphaned_user_ids",
     "SessionLocal",
     "DEV_USER_ID",
     "get_db",

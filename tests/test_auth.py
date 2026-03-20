@@ -53,6 +53,43 @@ def test_shared_db_roundtrip(tmp_path):
         reset_engine()
 
 
+def test_find_orphaned_user_ids(tmp_path):
+    """find_orphaned_user_ids detects tokens for deleted users."""
+    os.environ["ENVIRONMENT"] = "development"
+    os.environ["DATA_DIR"] = str(tmp_path)
+
+    from flyfun_common.db.engine import (
+        get_engine, init_shared_db, reset_engine, SessionLocal, ensure_dev_user,
+        find_orphaned_user_ids,
+    )
+    from flyfun_common.db.models import ApiTokenRow, UserRow
+
+    reset_engine()
+    get_engine()
+    init_shared_db()
+
+    session = SessionLocal()
+    try:
+        ensure_dev_user(session)
+
+        # No orphans yet
+        assert find_orphaned_user_ids(session, ApiTokenRow) == []
+
+        # Create a token for a non-existent user (simulates post-deletion orphan)
+        session.add(ApiTokenRow(
+            user_id="ghost-user",
+            token_hash="orphan_hash",
+            name="orphan token",
+        ))
+        session.commit()
+
+        orphaned = find_orphaned_user_ids(session, ApiTokenRow)
+        assert orphaned == ["ghost-user"]
+    finally:
+        session.close()
+        reset_engine()
+
+
 def test_delete_account(tmp_path):
     """DELETE /auth/account removes user and all associated shared data."""
     os.environ["ENVIRONMENT"] = "development"

@@ -107,6 +107,66 @@ if user.credit_balance < cost:
     raise HTTPException(402, "Insufficient credits")
 ```
 
+## Account Deletion & Orphaned Data Cleanup
+
+When a user deletes their account via `DELETE /auth/account`, the endpoint
+deletes all shared-table rows (`cost_ledger`, `user_preferences`, `api_tokens`,
+`users`) and calls the app's `on_delete_user` callback to clean up app-specific
+data.  However, if the deletion is triggered from one service and another
+service also holds app-specific data for that user, the second service's data
+becomes orphaned.
+
+### Detecting orphaned data
+
+`find_orphaned_user_ids(db, Model)` returns user IDs that appear in a given
+model's table but no longer exist in the `users` table:
+
+```python
+from flyfun_common.db import find_orphaned_user_ids, SessionLocal
+from myapp.models import UsageRow, FlightRow
+
+session = SessionLocal()
+orphaned = find_orphaned_user_ids(session, UsageRow)
+# → ["deleted-user-abc", "deleted-user-xyz"]
+```
+
+### Implementing cleanup in each service
+
+Each service should run a periodic cleanup job (e.g. daily cron, startup task,
+or background worker) that checks its own tables for orphaned user data and
+deletes it:
+
+```python
+from flyfun_common.db import find_orphaned_user_ids, SessionLocal
+
+def cleanup_orphaned_data():
+    """Remove app-specific data for users that no longer exist."""
+    db = SessionLocal()
+    try:
+        for model in [UsageRow, FlightRow]:  # all app-specific models
+            orphaned = find_orphaned_user_ids(db, model)
+            if orphaned:
+                db.query(model).filter(model.user_id.in_(orphaned)).delete(
+                    synchronize_session=False
+                )
+                logger.info("Cleaned up %d orphaned rows from %s",
+                            len(orphaned), model.__tablename__)
+        db.commit()
+    finally:
+        db.close()
+```
+
+### Guidelines
+
+- **Each app owns its cleanup**: flyfun-common provides the detection utility;
+  each app decides which tables to scan and how often.
+- **Run periodically**: A daily schedule is sufficient — orphaned data is
+  harmless in the short term since it's only accessible by authenticated user
+  ID.
+- **Log deletions**: Always log what was removed for auditing.
+- **No new tables needed**: The `users` table is the source of truth — if a
+  `user_id` isn't in `users`, the data is orphaned.
+
 ## Key Choices
 
 - **No FK constraint on `api_tokens.user_id`**: The column is just `String(64)` with an index, not a `ForeignKey`. This avoids issues with table creation order when shared and app-specific tables use different `Base` classes. Referential integrity is enforced at the application level.

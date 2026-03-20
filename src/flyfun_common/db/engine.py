@@ -98,3 +98,26 @@ def ensure_dev_user(session: Session) -> None:
         session.add(UserPreferencesRow(user_id=DEV_USER_ID))
         session.commit()
         logger.info("Dev user created: %s", DEV_USER_ID)
+
+
+def find_orphaned_user_ids(db: Session, model: type, user_id_col: str = "user_id") -> list[str]:
+    """Return user IDs referenced in *model* that no longer exist in the users table.
+
+    Usage::
+
+        from flyfun_common.db import find_orphaned_user_ids
+        from myapp.models import UsageRow
+
+        orphaned = find_orphaned_user_ids(db, UsageRow)
+        # → ["deleted-user-abc", "deleted-user-xyz"]
+
+    Args:
+        db: SQLAlchemy session.
+        model: Any mapped class with a ``user_id`` column.
+        user_id_col: Column name on *model* that holds the user ID
+                     (default ``"user_id"``).
+    """
+    col = getattr(model, user_id_col)
+    subq = db.query(UserRow.id).subquery()
+    rows = db.query(col).distinct().filter(col.notin_(db.query(subq))).all()
+    return [r[0] for r in rows]
