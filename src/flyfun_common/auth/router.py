@@ -35,7 +35,7 @@ from flyfun_common.auth.config import (
 )
 from flyfun_common.auth.jwt_utils import create_token
 from flyfun_common.db.deps import current_user_id, get_db
-from flyfun_common.db.models import UserRow
+from flyfun_common.db.models import ApiTokenRow, CostLedgerRow, UserPreferencesRow, UserRow
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +142,15 @@ class AppleTokenRequest(BaseModel):
 
 def create_auth_router(
     on_new_user: callable | None = None,
+    on_delete_user: callable | None = None,
 ) -> APIRouter:
     """Create an auth router.
 
     Args:
         on_new_user: Optional callback(user: UserRow, request: Request, db: Session)
                      called after a new user is created (e.g. send welcome email).
+        on_delete_user: Optional callback(user_id: str, db: Session) called before
+                        deleting a user, so apps can clean up app-specific data.
     """
     router = APIRouter(prefix="/auth", tags=["auth"])
     oauth = create_oauth()
@@ -354,6 +357,25 @@ def create_auth_router(
             "name": user.display_name,
             "approved": user.approved,
         }
+
+    @router.delete("/account", status_code=204)
+    def delete_account(
+        user_id: str = Depends(current_user_id), db: Session = Depends(get_db)
+    ):
+        """Delete the authenticated user's account and all associated data."""
+        logger.info("Account deletion requested for user %s", user_id)
+
+        # Let the app clean up its own data first
+        if on_delete_user:
+            on_delete_user(user_id, db)
+
+        # Delete shared tables
+        db.query(CostLedgerRow).filter(CostLedgerRow.user_id == user_id).delete()
+        db.query(UserPreferencesRow).filter(UserPreferencesRow.user_id == user_id).delete()
+        db.query(ApiTokenRow).filter(ApiTokenRow.user_id == user_id).delete()
+        db.query(UserRow).filter(UserRow.id == user_id).delete()
+
+        logger.info("Account deleted for user %s", user_id)
 
     return router
 

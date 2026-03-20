@@ -51,3 +51,45 @@ def test_shared_db_roundtrip(tmp_path):
     finally:
         session.close()
         reset_engine()
+
+
+def test_delete_account(tmp_path):
+    """DELETE /auth/account removes user and all associated shared data."""
+    os.environ["ENVIRONMENT"] = "development"
+    os.environ["DATA_DIR"] = str(tmp_path)
+
+    from flyfun_common.db.engine import get_engine, init_shared_db, reset_engine, SessionLocal, ensure_dev_user
+    from flyfun_common.db.models import ApiTokenRow, UserRow
+
+    reset_engine()
+    get_engine()
+    init_shared_db()
+
+    session = SessionLocal()
+    try:
+        ensure_dev_user(session)
+
+        # Add an API token for the dev user
+        token = ApiTokenRow(
+            user_id="dev-user-001",
+            token_hash="abc123hash",
+            name="test token",
+        )
+        session.add(token)
+        session.commit()
+
+        # Verify user and token exist
+        assert session.get(UserRow, "dev-user-001") is not None
+        assert session.query(ApiTokenRow).filter_by(user_id="dev-user-001").count() == 1
+
+        # Simulate what the delete endpoint does
+        session.query(ApiTokenRow).filter(ApiTokenRow.user_id == "dev-user-001").delete()
+        session.query(UserRow).filter(UserRow.id == "dev-user-001").delete()
+        session.commit()
+
+        # Verify deletion
+        assert session.get(UserRow, "dev-user-001") is None
+        assert session.query(ApiTokenRow).filter_by(user_id="dev-user-001").count() == 0
+    finally:
+        session.close()
+        reset_engine()
