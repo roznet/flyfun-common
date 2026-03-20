@@ -110,8 +110,8 @@ if user.credit_balance < cost:
 ## Account Deletion & Orphaned Data Cleanup
 
 When a user deletes their account via `DELETE /auth/account`, the endpoint
-deletes all shared-table rows (`cost_ledger`, `user_preferences`, `api_tokens`,
-`users`) and calls the app's `on_delete_user` callback to clean up app-specific
+deletes shared-table rows (`user_preferences`, `api_tokens`,
+`users`) but retains `cost_ledger` rows for audit and reporting purposes and calls the app's `on_delete_user` callback to clean up app-specific
 data.  However, if the deletion is triggered from one service and another
 service also holds app-specific data for that user, the second service's data
 becomes orphaned.

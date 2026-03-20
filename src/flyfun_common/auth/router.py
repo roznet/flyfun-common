@@ -35,7 +35,7 @@ from flyfun_common.auth.config import (
 )
 from flyfun_common.auth.jwt_utils import create_token
 from flyfun_common.db.deps import current_user_id, get_db
-from flyfun_common.db.models import ApiTokenRow, CostLedgerRow, UserPreferencesRow, UserRow
+from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
 
 logger = logging.getLogger(__name__)
 
@@ -369,8 +369,7 @@ def create_auth_router(
         if on_delete_user:
             on_delete_user(user_id, db)
 
-        # Delete shared tables
-        db.query(CostLedgerRow).filter(CostLedgerRow.user_id == user_id).delete()
+        # Delete shared tables (cost_ledger rows are kept for audit/reporting)
         db.query(UserPreferencesRow).filter(UserPreferencesRow.user_id == user_id).delete()
         db.query(ApiTokenRow).filter(ApiTokenRow.user_id == user_id).delete()
         db.query(UserRow).filter(UserRow.id == user_id).delete()
