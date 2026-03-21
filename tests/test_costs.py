@@ -73,3 +73,26 @@ def test_service_filter(db):
     record_cost(db, "u1", "weather", "briefing", 1.0)
     record_cost(db, "u1", "customs", "lookup", 0.5)
     assert get_total_cost(db, "u1", service="customs") == pytest.approx(0.5)
+
+
+def test_record_cost_extended_fields(db):
+    row = record_cost(
+        db, "u1", "weather", "briefing", 0.05,
+        category="briefing",
+        description="Briefing cost (5.00 credits)",
+        detail_json='{"total_usd": 0.05, "token_cost_usd": 0.03}',
+        reference_id="42",
+    )
+    assert row.category == "briefing"
+    assert row.description == "Briefing cost (5.00 credits)"
+    assert row.detail_json == '{"total_usd": 0.05, "token_cost_usd": 0.03}'
+    assert row.reference_id == "42"
+
+
+def test_record_cost_extended_fields_default_none(db):
+    """Existing callers that don't pass extended fields get None."""
+    row = record_cost(db, "u1", "weather", "briefing", 0.05)
+    assert row.category is None
+    assert row.description is None
+    assert row.detail_json is None
+    assert row.reference_id is None

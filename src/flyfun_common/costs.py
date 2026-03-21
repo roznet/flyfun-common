@@ -18,6 +18,11 @@ def record_cost(
     action: str,
     cost: float,
     metadata: dict | None = None,
+    *,
+    category: str | None = None,
+    description: str | None = None,
+    detail_json: str | None = None,
+    reference_id: str | None = None,
 ) -> CostLedgerRow:
     """Record a cost entry in the ledger."""
     row = CostLedgerRow(
@@ -26,6 +31,10 @@ def record_cost(
         action=action,
         cost=cost,
         metadata_json=json.dumps(metadata) if metadata else None,
+        category=category,
+        description=description,
+        detail_json=detail_json,
+        reference_id=reference_id,
     )
     db.add(row)
     db.flush()

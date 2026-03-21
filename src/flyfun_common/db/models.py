@@ -79,3 +79,8 @@ class CostLedgerRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # Extended columns for richer cost attribution (all nullable for backward compat)
+    category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
