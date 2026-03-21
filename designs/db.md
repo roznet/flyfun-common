@@ -27,7 +27,7 @@ db/
 | `email` | String(256) | From OAuth profile |
 | `display_name` | String(256) | |
 | `approved` | Boolean | Default True; admin can revoke |
-| `credit_balance` | Float | Default 500.0 (for metered services) |
+| `spending_limit` | Float | Default 500.0 (dormant — for future donation model) |
 | `created_at` | DateTime(tz) | |
 | `last_login_at` | DateTime(tz) | Nullable |
 
@@ -42,6 +42,24 @@ db/
 | `expires_at` | DateTime(tz) | Nullable (no expiry if null) |
 | `last_used_at` | DateTime(tz) | Updated on each use |
 | `revoked` | Boolean | Soft revocation |
+
+**`cost_ledger`** — cross-app cost tracking (all apps write here via `record_cost()`):
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | Integer PK | Auto-increment |
+| `user_id` | String(64) | Indexed, no FK (survives user deletion) |
+| `service` | String(64) | `"flyfun-weather"`, `"flyfun-maps"`, `"flyfun-forms"` |
+| `action` | String(64) | `"briefing"`, `"chat"`, `"generate"`, `"topup"` |
+| `cost` | Float | Always positive USD. Topups have cost=0.0 |
+| `metadata_json` | Text | Nullable — lightweight context |
+| `created_at` | DateTime(tz) | Auto-set |
+| `category` | String(32) | Nullable — `"briefing"`, `"topup"` |
+| `description` | String(256) | Nullable — human-readable |
+| `detail_json` | Text | Nullable — rich structured data (e.g. CostBreakdown) |
+| `reference_id` | String(128) | Nullable — app-level FK as string |
+
+Helper utilities in `flyfun_common.costs`: `record_cost()`, `get_total_cost()`, `get_cost_since()`, `check_budget()`, `get_cost_breakdown()`.
 
 ### No ORM Relationships on Shared Models
 
@@ -99,12 +117,11 @@ def my_action(user_id: str = Depends(current_user_id), db=Depends(get_db)):
 ```
 
 ```python
-# Query the shared user directly
-from flyfun_common.db import UserRow
+# Record a cost in the shared ledger
+from flyfun_common.costs import record_cost
 
-user = db.get(UserRow, user_id)
-if user.credit_balance < cost:
-    raise HTTPException(402, "Insufficient credits")
+record_cost(db, user_id, service="my-app", action="generate", cost=0.05,
+            metadata={"model": "gpt-4"})
 ```
 
 ## Account Deletion & Orphaned Data Cleanup
@@ -170,7 +187,8 @@ def cleanup_orphaned_data():
 ## Key Choices
 
 - **No FK constraint on `api_tokens.user_id` or `cost_ledger.user_id`**: Both are plain `String(64)` with an index, no `ForeignKey`. For `api_tokens` this avoids table creation order issues between shared and app-specific `Base` classes. For `cost_ledger` this ensures rows survive user deletion (audit/reporting data).
-- **`credit_balance` on UserRow**: Kept from flyfun-weather. Apps that don't use credits simply ignore it. Avoids a separate table for a single float.
+- **`spending_limit` on UserRow**: Dormant — used by weather for auto-reload tracking. Will become relevant if voluntary donations are added. Apps that don't need it simply ignore it.
+- **`cost_ledger` extended columns** (`category`, `description`, `detail_json`, `reference_id`): All nullable so simple apps (maps, forms) can call `record_cost()` with just the positional args, while weather stores rich CostBreakdown data in `detail_json`.
 - **Single `flyfun.db` in dev**: All apps share one SQLite file locally. Simulates the shared MySQL in production.
 - **`get_db()` auto-commits**: The generator commits on success, rolls back on exception. Endpoints don't need explicit `db.commit()`.
 
