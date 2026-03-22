@@ -44,6 +44,7 @@ def create_hub_router(
                 CostLedgerRow.service,
                 func.sum(CostLedgerRow.cost).label("cost_usd"),
                 func.count().label("action_count"),
+                func.max(CostLedgerRow.created_at).label("last_active"),
             )
             .filter(CostLedgerRow.cost > 0)  # exclude topups
         )
@@ -53,15 +54,23 @@ def create_hub_router(
 
         # Build per-user map
         user_map: dict[str, dict] = {}
-        for user_id, service, cost_usd, count in rows:
+        for user_id, service, cost_usd, count, last_active in rows:
             if user_id not in user_map:
-                user_map[user_id] = {"services": {}, "total_cost_usd": 0.0, "total_actions": 0}
+                user_map[user_id] = {
+                    "services": {}, "total_cost_usd": 0.0,
+                    "total_actions": 0, "last_active": None,
+                }
             user_map[user_id]["services"][service] = {
                 "cost_usd": round(float(cost_usd), 4),
                 "count": int(count),
             }
             user_map[user_id]["total_cost_usd"] += float(cost_usd)
             user_map[user_id]["total_actions"] += int(count)
+            if last_active and (
+                user_map[user_id]["last_active"] is None
+                or last_active > user_map[user_id]["last_active"]
+            ):
+                user_map[user_id]["last_active"] = last_active
 
         # Fetch user details for all users with cost data
         user_ids = list(user_map.keys())
@@ -71,10 +80,15 @@ def create_hub_router(
             users = []
         user_info = {u.id: u for u in users}
 
-        # Build response
+        # Build response (default sort: most recently active first)
         result_users = []
-        for uid, data in sorted(user_map.items(), key=lambda x: x[1]["total_cost_usd"], reverse=True):
+        for uid, data in sorted(
+            user_map.items(),
+            key=lambda x: x[1]["last_active"] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        ):
             u = user_info.get(uid)
+            la = data["last_active"]
             result_users.append({
                 "id": uid,
                 "email": u.email if u else "",
@@ -83,6 +97,7 @@ def create_hub_router(
                 "services": data["services"],
                 "total_cost_usd": round(data["total_cost_usd"], 4),
                 "total_actions": data["total_actions"],
+                "last_active": la.isoformat() if la else None,
             })
 
         total_cost = sum(u["total_cost_usd"] for u in result_users)
