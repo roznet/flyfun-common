@@ -48,7 +48,12 @@ def get_engine(db_url: str | None = None) -> Engine:
         connect_args["check_same_thread"] = False
         connect_args["timeout"] = 30
 
-    _engine = create_engine(db_url, connect_args=connect_args)
+    pool_kwargs = {}
+    if not db_url.startswith("sqlite"):
+        pool_kwargs["pool_pre_ping"] = True
+        pool_kwargs["pool_recycle"] = 3600
+
+    _engine = create_engine(db_url, connect_args=connect_args, **pool_kwargs)
     SessionLocal.configure(bind=_engine)
 
     if db_url.startswith("sqlite"):
