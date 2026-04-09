@@ -170,7 +170,7 @@ def create_autorouter_router() -> APIRouter:
         _store_token(db, user_id, token_data)
         logger.info("User %s linked Autorouter account", user_id)
 
-        return RedirectResponse(url="/settings?autorouter=linked", status_code=302)
+        return RedirectResponse(url="/settings.html?autorouter=linked", status_code=302)
 
     @router.get("/autorouter/status")
     async def status(
