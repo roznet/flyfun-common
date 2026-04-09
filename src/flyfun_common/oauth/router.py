@@ -42,16 +42,25 @@ class RegisterRequest(BaseModel):
 
 def _oauth_error_redirect(
     redirect_uri: str, error: str, state: str | None, description: str = ""
-) -> RedirectResponse:
-    """Build an OAuth error redirect per RFC 6749 §4.1.2.1."""
+) -> HTMLResponse:
+    """Build an OAuth error redirect per RFC 6749 §4.1.2.1.
+
+    Uses JS + meta-refresh instead of HTTP 303 — some OAuth clients
+    intercept form submissions via fetch(), which mishandles HTTP redirects.
+    """
     params: dict[str, str] = {"error": error}
     if description:
         params["error_description"] = description
     if state:
         params["state"] = state
     sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(
-        url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=303
+    url = f"{redirect_uri}{sep}{urlencode(params)}"
+    return HTMLResponse(
+        content=(
+            f'<html><head><meta http-equiv="refresh" content="0;url={html_escape(url)}">'
+            f'</head><body><script>window.location.href={json.dumps(url)};</script>'
+            f'<p>Redirecting...</p></body></html>'
+        ),
     )
 
 
@@ -339,8 +348,16 @@ def create_oauth_router(
         if state:
             params["state"] = state
         sep = "&" if "?" in redirect_uri else "?"
-        return RedirectResponse(
-            url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=303
+        callback_url = f"{redirect_uri}{sep}{urlencode(params)}"
+
+        # Use JS redirect instead of HTTP 303 — some OAuth clients (claude.ai)
+        # intercept form submissions via fetch(), which mishandles HTTP redirects.
+        return HTMLResponse(
+            content=(
+                f'<html><head><meta http-equiv="refresh" content="0;url={html_escape(callback_url)}">'
+                f'</head><body><script>window.location.href={json.dumps(callback_url)};</script>'
+                f'<p>Redirecting...</p></body></html>'
+            ),
         )
 
     # ---- Token Endpoint ----

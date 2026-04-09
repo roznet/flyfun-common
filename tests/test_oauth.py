@@ -217,6 +217,18 @@ def test_authorize_rejects_bad_redirect_uri(client):
     assert resp.status_code == 400
 
 
+def _extract_redirect_url(resp):
+    """Extract redirect URL from JS redirect HTML response."""
+    assert resp.status_code == 200
+    match = re.search(r'window\.location\.href="([^"]+)"', resp.text)
+    if not match:
+        match = re.search(r'window\.location\.href=(".*?")', resp.text)
+        if match:
+            return json.loads(match.group(1))
+    assert match, f"No redirect URL found in: {resp.text[:200]}"
+    return match.group(1)
+
+
 def test_authorize_approve(client):
     client_id, _ = _register_client(client)
     _, challenge = _make_challenge()
@@ -231,9 +243,8 @@ def test_authorize_approve(client):
         "state": "mystate",
         "scope": "mcp",
         "csrf_token": csrf,
-    })
-    assert resp.status_code == 303
-    location = resp.headers["location"]
+    }, follow_redirects=False)
+    location = _extract_redirect_url(resp)
     parsed = urlparse(location)
     params = parse_qs(parsed.query)
     assert "code" in params
@@ -254,9 +265,8 @@ def test_authorize_deny(client):
         "code_challenge_method": "S256",
         "state": "mystate",
         "csrf_token": csrf,
-    })
-    assert resp.status_code == 303
-    location = resp.headers["location"]
+    }, follow_redirects=False)
+    location = _extract_redirect_url(resp)
     params = parse_qs(urlparse(location).query)
     assert params["error"] == ["access_denied"]
     assert params["state"] == ["mystate"]
@@ -291,8 +301,8 @@ def test_authorize_rejects_invalid_scope(client):
         "code_challenge_method": "S256",
         "scope": "admin",
     })
-    assert resp.status_code == 303
-    params = parse_qs(urlparse(resp.headers["location"]).query)
+    location = _extract_redirect_url(resp)
+    params = parse_qs(urlparse(location).query)
     assert params["error"] == ["invalid_scope"]
 
 
@@ -311,8 +321,8 @@ def _approve_and_get_code(test_client, client_id, challenge, redirect_uri="https
         "state": "s",
         "scope": "mcp",
         "csrf_token": csrf,
-    })
-    location = resp.headers["location"]
+    }, follow_redirects=False)
+    location = _extract_redirect_url(resp)
     params = parse_qs(urlparse(location).query)
     return params["code"][0]
 
