@@ -71,7 +71,7 @@ def get_autorouter_token(db: Session, user_id: str) -> str | None:
     return ar.get("access_token")
 
 
-def create_autorouter_router() -> APIRouter:
+def create_autorouter_router(*, success_redirect: str = "/settings.html?autorouter=linked") -> APIRouter:
     """Create a router for Autorouter OAuth account linking.
 
     Provides:
@@ -170,7 +170,7 @@ def create_autorouter_router() -> APIRouter:
         _store_token(db, user_id, token_data)
         logger.info("User %s linked Autorouter account", user_id)
 
-        return RedirectResponse(url="/settings.html?autorouter=linked", status_code=302)
+        return RedirectResponse(url=success_redirect, status_code=302)
 
     @router.get("/autorouter/status")
     async def status(
