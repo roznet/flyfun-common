@@ -303,8 +303,8 @@ def create_oauth_router(
         if user_id is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
 
-        # Validate CSRF token
-        expected_csrf = request.session.pop("oauth_csrf", None)
+        # Validate CSRF token (use get, not pop — clients may replay the POST)
+        expected_csrf = request.session.get("oauth_csrf")
         if not expected_csrf or not hmac.compare_digest(csrf_token, expected_csrf):
             raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
 
