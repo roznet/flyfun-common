@@ -29,7 +29,7 @@ GET /autorouter/link (requires active flyfun session)
   ↓
 User authorizes on Autorouter's site
   ↓
-GET /autorouter/callback?code=...&state=...
+GET /auth/callback/autorouter?code=...&state=...
   → validates state (CSRF protection)
   → exchanges code for access token at Autorouter's token endpoint
   → stores token encrypted in UserPreferencesRow
@@ -64,7 +64,7 @@ This uses the existing `credentials.py` helpers (Fernet encryption at rest) — 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `GET` | `/autorouter/link` | Required | Start OAuth flow → redirect to Autorouter |
-| `GET` | `/autorouter/callback` | Session | Handle Autorouter redirect, exchange code |
+| `GET` | `/auth/callback/autorouter` | Session | Handle Autorouter redirect, exchange code |
 | `GET` | `/autorouter/status` | Required | Check if user has linked account |
 | `POST` | `/autorouter/unlink` | Required | Remove stored Autorouter token |
 

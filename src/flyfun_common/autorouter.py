@@ -75,14 +75,14 @@ def create_autorouter_router() -> APIRouter:
     """Create a router for Autorouter OAuth account linking.
 
     Provides:
-        GET  /autorouter/link      – start OAuth flow (redirects to Autorouter)
-        GET  /autorouter/callback   – handle redirect back from Autorouter
-        GET  /autorouter/status     – check if user has linked account
-        POST /autorouter/unlink     – remove stored token
+        GET  /autorouter/link              – start OAuth flow (redirects to Autorouter)
+        GET  /auth/callback/autorouter     – handle redirect back from Autorouter
+        GET  /autorouter/status            – check if user has linked account
+        POST /autorouter/unlink            – remove stored token
     """
-    router = APIRouter(prefix="/autorouter", tags=["autorouter"])
+    router = APIRouter(tags=["autorouter"])
 
-    @router.get("/link")
+    @router.get("/autorouter/link")
     async def link(request: Request, user_id: str = Depends(current_user_id)):
         """Redirect the user to Autorouter's authorization page."""
         client_id = _get_client_id()
@@ -110,7 +110,7 @@ def create_autorouter_router() -> APIRouter:
         )
         return RedirectResponse(url=authorize_url, status_code=302)
 
-    @router.get("/callback", name="autorouter_callback")
+    @router.get("/auth/callback/autorouter", name="autorouter_callback")
     async def callback(
         request: Request,
         code: str | None = None,
@@ -172,7 +172,7 @@ def create_autorouter_router() -> APIRouter:
 
         return RedirectResponse(url="/settings?autorouter=linked", status_code=302)
 
-    @router.get("/status")
+    @router.get("/autorouter/status")
     async def status(
         user_id: str = Depends(current_user_id),
         db: Session = Depends(get_db),
@@ -185,7 +185,7 @@ def create_autorouter_router() -> APIRouter:
             "linked_at": ar.get("linked_at") if ar else None,
         }
 
-    @router.post("/unlink")
+    @router.post("/autorouter/unlink")
     async def unlink(
         user_id: str = Depends(current_user_id),
         db: Session = Depends(get_db),
