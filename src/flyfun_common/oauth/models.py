@@ -33,6 +33,10 @@ class OAuthAuthorizationCodeRow(Base):
     scope: Mapped[str] = mapped_column(String(256), default="mcp")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Set when tokens are issued — enables revocation on auth code replay
+    access_token_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None
+    )
 
 
 class OAuthRefreshTokenRow(Base):

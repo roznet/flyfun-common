@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -154,6 +155,23 @@ def _make_challenge():
     return verifier, challenge
 
 
+def _get_csrf_token(test_client, client_id, challenge, redirect_uri="https://example.com/callback"):
+    """GET the consent page and extract the CSRF token from the HTML."""
+    resp = test_client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+        "scope": "mcp",
+    })
+    assert resp.status_code == 200
+    match = re.search(r'name="csrf_token"\s+value="([^"]+)"', resp.text)
+    assert match, "CSRF token not found in consent page"
+    return match.group(1)
+
+
 def test_authorize_shows_consent_in_dev_mode(client):
     """In dev mode, user is auto-authenticated → consent page shown."""
     client_id, _ = _register_client(client)
@@ -202,6 +220,7 @@ def test_authorize_rejects_bad_redirect_uri(client):
 def test_authorize_approve(client):
     client_id, _ = _register_client(client)
     _, challenge = _make_challenge()
+    csrf = _get_csrf_token(client, client_id, challenge)
 
     resp = client.post("/oauth/authorize", data={
         "action": "approve",
@@ -211,6 +230,7 @@ def test_authorize_approve(client):
         "code_challenge_method": "S256",
         "state": "mystate",
         "scope": "mcp",
+        "csrf_token": csrf,
     })
     assert resp.status_code == 302
     location = resp.headers["location"]
@@ -224,6 +244,7 @@ def test_authorize_approve(client):
 def test_authorize_deny(client):
     client_id, _ = _register_client(client)
     _, challenge = _make_challenge()
+    csrf = _get_csrf_token(client, client_id, challenge)
 
     resp = client.post("/oauth/authorize", data={
         "action": "deny",
@@ -232,6 +253,7 @@ def test_authorize_deny(client):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": "mystate",
+        "csrf_token": csrf,
     })
     assert resp.status_code == 302
     location = resp.headers["location"]
@@ -240,11 +262,46 @@ def test_authorize_deny(client):
     assert params["state"] == ["mystate"]
 
 
+def test_authorize_rejects_missing_csrf(client):
+    """POST without CSRF token is rejected."""
+    client_id, _ = _register_client(client)
+    _, challenge = _make_challenge()
+
+    resp = client.post("/oauth/authorize", data={
+        "action": "approve",
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "csrf_token": "forged-token",
+    })
+    assert resp.status_code == 403
+
+
+def test_authorize_rejects_invalid_scope(client):
+    """Requesting an unsupported scope returns an error redirect."""
+    client_id, _ = _register_client(client)
+    _, challenge = _make_challenge()
+
+    resp = client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "scope": "admin",
+    })
+    assert resp.status_code == 302
+    params = parse_qs(urlparse(resp.headers["location"]).query)
+    assert params["error"] == ["invalid_scope"]
+
+
 # --- Token Exchange Tests ---
 
 
 def _approve_and_get_code(test_client, client_id, challenge, redirect_uri="https://example.com/callback"):
-    """Approve authorization and extract the code from the redirect."""
+    """GET consent page (sets CSRF), approve, and extract the code from the redirect."""
+    csrf = _get_csrf_token(test_client, client_id, challenge, redirect_uri)
     resp = test_client.post("/oauth/authorize", data={
         "action": "approve",
         "client_id": client_id,
@@ -253,6 +310,7 @@ def _approve_and_get_code(test_client, client_id, challenge, redirect_uri="https
         "code_challenge_method": "S256",
         "state": "s",
         "scope": "mcp",
+        "csrf_token": csrf,
     })
     location = resp.headers["location"]
     params = parse_qs(urlparse(location).query)
@@ -455,3 +513,75 @@ def test_refresh_token_wrong_client(client, db_session):
     })
     assert resp.status_code == 400
     assert "Client mismatch" in resp.json()["error_description"]
+
+
+def test_code_replay_revokes_tokens(client, db_session):
+    """Replaying a used auth code revokes all tokens issued from it (RFC 6749 §10.5)."""
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    # First exchange succeeds
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "code_verifier": verifier,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    assert resp.status_code == 200
+    tokens = resp.json()
+
+    # Replay the code
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "code_verifier": verifier,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    assert resp.status_code == 400
+
+    # Access token should now be revoked
+    at_hash = hash_token(tokens["access_token"])
+    at_row = db_session.query(ApiTokenRow).filter_by(token_hash=at_hash).first()
+    assert at_row.revoked is True
+
+    # Refresh token should now be revoked
+    rt_hash = hash_token(tokens["refresh_token"])
+    rt_row = db_session.query(OAuthRefreshTokenRow).filter_by(token_hash=rt_hash).first()
+    assert rt_row.revoked is True
+
+
+def test_refresh_token_expired(client, db_session):
+    """Expired refresh tokens are rejected."""
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "code_verifier": verifier,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    tokens = resp.json()
+
+    # Manually expire the refresh token
+    rt_hash = hash_token(tokens["refresh_token"])
+    rt_row = db_session.query(OAuthRefreshTokenRow).filter_by(token_hash=rt_hash).first()
+    rt_row.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    db_session.flush()
+
+    resp = client.post("/oauth/token", data={
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    assert resp.status_code == 400
+    assert "expired" in resp.json()["error_description"].lower()

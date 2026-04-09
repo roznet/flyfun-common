@@ -244,8 +244,11 @@ This is a server-rendered HTML page (not a SPA route) since it must work in a po
 
 - **PKCE required** (S256 only) — prevents authorization code interception
 - **Client secrets hashed** in DB (same as api_tokens)
-- **Authorization codes**: single-use, 10-minute expiry
+- **Authorization codes**: single-use, 10-minute expiry; replay revokes all tokens issued from that code (RFC 6749 §10.5)
+- **CSRF protection**: consent form includes a session-bound CSRF token, validated on POST with constant-time comparison
 - **Redirect URI validation**: exact match against registered URIs
+- **Scope validation**: requested scopes validated against `scopes_supported`; unsupported scopes return `invalid_scope` error redirect
+- **Refresh token expiry**: checked on use if `expires_at` is set
 - **Token revocation**: revoking from the Settings UI (existing token management) works — tokens issued via OAuth are regular `api_tokens` rows
 - **Rate limiting**: consider rate-limiting `/oauth/register` to prevent abuse (low priority — no real attack surface since registration just stores a row)
 

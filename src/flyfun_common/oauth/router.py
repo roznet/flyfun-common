@@ -78,6 +78,7 @@ def _render_consent_page(
     code_challenge_method: str,
     state: str,
     scope: str,
+    csrf_token: str,
 ) -> HTMLResponse:
     """Render the OAuth consent screen as server-side HTML."""
     # Escape all user-controlled values to prevent XSS
@@ -97,6 +98,7 @@ def _render_consent_page(
         ("code_challenge_method", code_challenge_method),
         ("state", state),
         ("scope", scope),
+        ("csrf_token", csrf_token),
     ]:
         hidden_fields += (
             f'<input type="hidden" name="{name}" value="{html_escape(value)}">\n'
@@ -253,9 +255,21 @@ def create_oauth_router(
             request.session["oauth_next"] = authorize_url
             return RedirectResponse(url=login_path, status_code=302)
 
+        # Validate scope
+        requested_scopes = scope.split()
+        if not all(s in scopes_supported for s in requested_scopes):
+            return _oauth_error_redirect(
+                redirect_uri, "invalid_scope", state,
+                f"Unsupported scope. Supported: {' '.join(scopes_supported)}",
+            )
+
         # Authenticated — show consent screen
         user = db.query(UserRow).filter(UserRow.id == user_id).first()
         user_email = user.email if user else user_id
+
+        # Generate CSRF token and store in session
+        csrf_token = secrets.token_urlsafe(32)
+        request.session["oauth_csrf"] = csrf_token
 
         return _render_consent_page(
             app_name=app_name,
@@ -268,6 +282,7 @@ def create_oauth_router(
             code_challenge_method=code_challenge_method,
             state=state,
             scope=scope,
+            csrf_token=csrf_token,
         )
 
     @router.post("/oauth/authorize")
@@ -280,12 +295,18 @@ def create_oauth_router(
         code_challenge_method: str = Form("S256"),
         state: str = Form(""),
         scope: str = Form("mcp"),
+        csrf_token: str = Form(...),
         db: Session = Depends(get_db),
     ):
         # Must be authenticated
         user_id = optional_user_id(request, db)
         if user_id is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
+
+        # Validate CSRF token
+        expected_csrf = request.session.pop("oauth_csrf", None)
+        if not expected_csrf or not hmac.compare_digest(csrf_token, expected_csrf):
+            raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
 
         # Validate client + redirect_uri
         client = db.query(OAuthClientRow).filter(OAuthClientRow.id == client_id).first()
@@ -406,6 +427,26 @@ def _handle_authorization_code(
         expires = expires.replace(tzinfo=timezone.utc)
 
     if auth_code.used:
+        # RFC 6749 §10.5: revoke all tokens issued from this code
+        if auth_code.access_token_hash:
+            issued_at = (
+                db.query(ApiTokenRow)
+                .filter(ApiTokenRow.token_hash == auth_code.access_token_hash)
+                .first()
+            )
+            if issued_at:
+                issued_at.revoked = True
+            issued_rt = (
+                db.query(OAuthRefreshTokenRow)
+                .filter(
+                    OAuthRefreshTokenRow.access_token_hash
+                    == auth_code.access_token_hash
+                )
+                .first()
+            )
+            if issued_rt:
+                issued_rt.revoked = True
+            db.flush()
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "Authorization code already used"},
             status_code=400,
@@ -435,7 +476,6 @@ def _handle_authorization_code(
 
     # Mark code as used
     auth_code.used = True
-    db.flush()
 
     # Issue access token
     access_token = generate_api_token()
@@ -451,6 +491,10 @@ def _handle_authorization_code(
             oauth_client_id=client.id,
         )
     )
+
+    # Link tokens back to auth code for replay revocation
+    auth_code.access_token_hash = access_hash
+    db.flush()
 
     # Issue refresh token
     refresh_plain = generate_api_token(prefix="ffr_")
@@ -497,6 +541,15 @@ def _handle_refresh_token(
             {"error": "invalid_grant", "error_description": "Invalid refresh token"},
             status_code=400,
         )
+    if rt.expires_at:
+        exp = rt.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp <= datetime.now(timezone.utc):
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "Refresh token expired"},
+                status_code=400,
+            )
     if rt.client_id != client.id:
         return JSONResponse(
             {"error": "invalid_grant", "error_description": "Client mismatch"},
