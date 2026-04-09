@@ -17,7 +17,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -254,6 +254,13 @@ def create_auth_router(
             scheme = request.session.pop("oauth_scheme", "flyfun")
             redirect_url = f"{scheme}://auth/callback?token={quote(jwt_token)}"
             return RedirectResponse(url=redirect_url, status_code=302)
+
+        # Resume OAuth authorize flow if we were redirected here from /oauth/authorize
+        oauth_next = request.session.pop("oauth_next", None)
+        if oauth_next and urlparse(oauth_next).path.startswith("/oauth/"):
+            response = RedirectResponse(url=oauth_next, status_code=302)
+            _set_session_cookie(response, jwt_token)
+            return response
 
         response = RedirectResponse(url="/", status_code=302)
         _set_session_cookie(response, jwt_token)

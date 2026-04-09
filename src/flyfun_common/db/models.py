@@ -54,6 +54,9 @@ class ApiTokenRow(Base):
         DateTime(timezone=True), nullable=True, default=None
     )
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    oauth_client_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None
+    )
 
 
 class UserPreferencesRow(Base):

@@ -31,6 +31,7 @@ dependencies = [
     "httpx",
     "cryptography>=42.0",
     "itsdangerous",
+    "python-multipart>=0.0.18",
 ]
 
 [project.optional-dependencies]

@@ -22,3 +22,8 @@ Key exports: `UserRow`, `ApiTokenRow`, `Base`, `get_db`, `current_user_id`, `ini
 OAuth2 account linking for Autorouter API access (NOTAMs, flight plans, weather). Service-linking flow for already-authenticated users — not a login provider.
 Key exports: `create_autorouter_router`, `get_autorouter_token`
 → Full doc: autorouter.md
+
+### mcp-oauth
+OAuth 2.1 authorization server for MCP connectors (claude.ai, Cowork). Dynamic client registration, PKCE, consent screen. Issues `api_tokens` tied to user accounts.
+Key exports: `create_oauth_router`, `OAuthClientRow`, `OAuthAuthorizationCodeRow`
+→ Full doc: mcp-oauth.md
