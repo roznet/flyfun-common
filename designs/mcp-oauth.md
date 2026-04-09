@@ -90,11 +90,11 @@ Response:
 
 | Column | Type | Notes |
 |--------|------|-------|
-| id | String PK | `mcp_` + random |
-| client_secret_hash | String | SHA-256 of secret |
-| client_name | String | Display name |
+| id | String(64) PK | `mcp_` + random |
+| client_secret_hash | String(64) | SHA-256 hex of secret |
+| client_name | String(256) | Display name, default `""` |
 | redirect_uris_json | Text | JSON array of allowed URIs |
-| created_at | DateTime | |
+| created_at | DateTime(tz) | Auto-set to UTC now |
 
 ### 3. Authorization
 
@@ -123,13 +123,14 @@ The `/oauth/authorize` endpoint:
 
 | Column | Type | Notes |
 |--------|------|-------|
-| code | String PK | Random, single-use |
-| client_id | String FK | → oauth_clients |
-| user_id | String FK | → users |
-| redirect_uri | String | Must match on exchange |
-| code_challenge | String | PKCE S256 |
-| expires_at | DateTime | Short-lived (~10 min) |
-| used | Boolean | Prevent replay |
+| code | String(64) PK | Random, single-use |
+| client_id | String(64) | → oauth_clients, indexed |
+| user_id | String(64) | → users, indexed |
+| redirect_uri | String(1024) | Must match on exchange |
+| code_challenge | String(128) | PKCE S256 |
+| scope | String(256) | Default `"mcp"` |
+| expires_at | DateTime(tz) | Short-lived (~10 min) |
+| used | Boolean | Default false, prevent replay |
 
 ### 4. Token Exchange
 
@@ -175,6 +176,22 @@ client_secret=secret_xyz
 
 Issues a new access token, rotates the refresh token, revokes the old access token.
 
+**New table: `oauth_refresh_tokens`**
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | Integer PK | Auto-increment |
+| token_hash | String(64) | SHA-256 hex, unique, indexed |
+| client_id | String(64) | → oauth_clients, indexed |
+| user_id | String(64) | → users, indexed |
+| access_token_hash | String(64) | Links to the api_tokens row it issued |
+| scope | String(256) | Default `"mcp"` |
+| created_at | DateTime(tz) | Auto-set to UTC now |
+| expires_at | DateTime(tz) | Nullable (no expiry = lives forever) |
+| revoked | Boolean | Default false, set true on rotation |
+
+**New column on `api_tokens`:** `oauth_client_id` — String(64), nullable. Tracks which OAuth client issued the token (for revocation/audit). Null for manually-created tokens.
+
 ### 6. MCP Requests
 
 Claude.ai sends `Authorization: Bearer ff_...` on every MCP request to `mcp.flyfun.aero/weather/mcp`. The existing `_extract_token()` → `current_user_id` chain handles this — no changes needed.
@@ -182,16 +199,17 @@ Claude.ai sends `Authorization: Bearer ff_...` on every MCP request to `mcp.flyf
 ## What Lives Where
 
 ### flyfun-common (new module: `oauth/`)
-- `oauth/models.py` — `OAuthClientRow`, `OAuthAuthorizationCodeRow` (shared Base)
+- `oauth/models.py` — `OAuthClientRow`, `OAuthAuthorizationCodeRow`, `OAuthRefreshTokenRow` (shared Base)
 - `oauth/router.py` — `create_oauth_router()` → FastAPI router with `/oauth/register`, `/oauth/authorize`, `/oauth/token`
 - `oauth/pkce.py` — PKCE S256 verification helper
-- Alembic migration for the two new tables
+- Models only — no Alembic migrations here (see flyfun-weather below)
 
 ### flyfun-apps (Caddy config)
 - Update `mcp.flyfun.aero.caddy` to serve `.well-known` JSON
 
 ### flyfun-weather
 - Mount the OAuth router: `app.include_router(create_oauth_router())`
+- Alembic migration for the three new tables + `api_tokens.oauth_client_id` column
 - No other changes — existing Bearer token validation already works
 
 ### weatherbrief MCP server
@@ -233,12 +251,90 @@ This is a server-rendered HTML page (not a SPA route) since it must work in a po
 
 ## Migration Path
 
-1. Build OAuth router in flyfun-common (models + endpoints)
-2. Add migration for `oauth_clients` and `oauth_authorization_codes` tables
-3. Mount router in weatherbrief app
-4. Update Caddy config for `.well-known`
+1. Build OAuth router in flyfun-common (models + endpoints) — **this repo**
+2. Add Alembic migration in the **consuming app** (e.g. flyfun-weather) for:
+   - `oauth_clients`, `oauth_authorization_codes`, `oauth_refresh_tokens` tables
+   - `api_tokens.oauth_client_id` column (nullable, added with `batch_alter_table`)
+   - flyfun-common defines the models; the consuming app owns migrations because it owns the database and Alembic env
+3. Mount router in weatherbrief app: `app.include_router(create_oauth_router())`
+4. Update Caddy config for `.well-known` (in flyfun-apps/shared-infra)
 5. Test with claude.ai connector
 6. Existing Bearer token flow (Claude Code, Settings UI) continues working unchanged
+
+### Alembic Migration Reference
+
+The migration in flyfun-weather should follow the pattern from `004_flight_profiles.py` (create tables + add FK column to existing table with `batch_alter_table`):
+
+```python
+"""Add OAuth 2.1 tables for MCP connectors.
+
+Revision ID: 041
+Revises: 040
+"""
+from __future__ import annotations
+
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "041"
+down_revision: Union[str, None] = "040"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "oauth_clients",
+        sa.Column("id", sa.String(64), primary_key=True),
+        sa.Column("client_secret_hash", sa.String(64), nullable=False),
+        sa.Column("client_name", sa.String(256), nullable=False, server_default=""),
+        sa.Column("redirect_uris_json", sa.Text, nullable=False, server_default="[]"),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+    )
+
+    op.create_table(
+        "oauth_authorization_codes",
+        sa.Column("code", sa.String(64), primary_key=True),
+        sa.Column("client_id", sa.String(64), nullable=False, index=True),
+        sa.Column("user_id", sa.String(64), nullable=False, index=True),
+        sa.Column("redirect_uri", sa.String(1024), nullable=False),
+        sa.Column("code_challenge", sa.String(128), nullable=False),
+        sa.Column("scope", sa.String(256), nullable=False, server_default="mcp"),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("used", sa.Boolean, nullable=False, server_default=sa.text("0")),
+    )
+
+    op.create_table(
+        "oauth_refresh_tokens",
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("token_hash", sa.String(64), nullable=False, unique=True, index=True),
+        sa.Column("client_id", sa.String(64), nullable=False, index=True),
+        sa.Column("user_id", sa.String(64), nullable=False, index=True),
+        sa.Column("access_token_hash", sa.String(64), nullable=False),
+        sa.Column("scope", sa.String(256), nullable=False, server_default="mcp"),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("revoked", sa.Boolean, nullable=False, server_default=sa.text("0")),
+    )
+
+    # Add oauth_client_id to existing api_tokens (nullable — null for manual tokens)
+    with op.batch_alter_table("api_tokens") as batch_op:
+        batch_op.add_column(
+            sa.Column("oauth_client_id", sa.String(64), nullable=True),
+        )
+
+
+def downgrade() -> None:
+    with op.batch_alter_table("api_tokens") as batch_op:
+        batch_op.drop_column("oauth_client_id")
+    op.drop_table("oauth_refresh_tokens")
+    op.drop_table("oauth_authorization_codes")
+    op.drop_table("oauth_clients")
+```
+
+> **Note:** Verify `down_revision` matches the latest migration in flyfun-weather at the time of creation. The example above assumes `040` is current.
 
 ## References
 

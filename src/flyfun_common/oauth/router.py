@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from urllib.parse import quote, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -13,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from flyfun_common.admin import generate_api_token, hash_token
-from flyfun_common.db.deps import _decode_user_id, get_db
+from flyfun_common.db.deps import get_db, optional_user_id
 from flyfun_common.db.models import ApiTokenRow, UserRow
 from flyfun_common.oauth.models import (
     OAuthAuthorizationCodeRow,
@@ -63,14 +65,6 @@ def _validate_redirect_uri(uri: str) -> bool:
     return False
 
 
-def _try_get_user_id(request: Request, db: Session) -> str | None:
-    """Return user_id if authenticated, None otherwise."""
-    try:
-        return _decode_user_id(request, db)
-    except HTTPException:
-        return None
-
-
 def _render_consent_page(
     *,
     app_name: str,
@@ -86,8 +80,13 @@ def _render_consent_page(
     scope: str,
 ) -> HTMLResponse:
     """Render the OAuth consent screen as server-side HTML."""
+    # Escape all user-controlled values to prevent XSS
+    client_name = html_escape(client_name)
+    user_email = html_escape(user_email)
+    app_name = html_escape(app_name)
+
     permission_items = "\n".join(
-        f'<li>{p}</li>' for p in permissions
+        f'<li>{html_escape(p)}</li>' for p in permissions
     )
 
     hidden_fields = ""
@@ -100,7 +99,7 @@ def _render_consent_page(
         ("scope", scope),
     ]:
         hidden_fields += (
-            f'<input type="hidden" name="{name}" value="{value}">\n'
+            f'<input type="hidden" name="{name}" value="{html_escape(value)}">\n'
         )
 
     html = f"""<!DOCTYPE html>
@@ -247,7 +246,7 @@ def create_oauth_router(
             raise HTTPException(status_code=400, detail="redirect_uri not registered")
 
         # Check authentication
-        user_id = _try_get_user_id(request, db)
+        user_id = optional_user_id(request, db)
         if user_id is None:
             # Store the full authorize URL in session so we can resume after login
             authorize_url = str(request.url)
@@ -284,7 +283,7 @@ def create_oauth_router(
         db: Session = Depends(get_db),
     ):
         # Must be authenticated
-        user_id = _try_get_user_id(request, db)
+        user_id = optional_user_id(request, db)
         if user_id is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -348,7 +347,9 @@ def create_oauth_router(
             )
 
         client = db.query(OAuthClientRow).filter(OAuthClientRow.id == client_id).first()
-        if not client or hash_token(client_secret) != client.client_secret_hash:
+        if not client or not hmac.compare_digest(
+            hash_token(client_secret), client.client_secret_hash
+        ):
             return JSONResponse(
                 {"error": "invalid_client", "error_description": "Bad client credentials"},
                 status_code=401,
