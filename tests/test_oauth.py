@@ -232,7 +232,7 @@ def test_authorize_approve(client):
         "scope": "mcp",
         "csrf_token": csrf,
     })
-    assert resp.status_code == 302
+    assert resp.status_code == 303
     location = resp.headers["location"]
     parsed = urlparse(location)
     params = parse_qs(parsed.query)
@@ -255,7 +255,7 @@ def test_authorize_deny(client):
         "state": "mystate",
         "csrf_token": csrf,
     })
-    assert resp.status_code == 302
+    assert resp.status_code == 303
     location = resp.headers["location"]
     params = parse_qs(urlparse(location).query)
     assert params["error"] == ["access_denied"]
@@ -291,7 +291,7 @@ def test_authorize_rejects_invalid_scope(client):
         "code_challenge_method": "S256",
         "scope": "admin",
     })
-    assert resp.status_code == 302
+    assert resp.status_code == 303
     params = parse_qs(urlparse(resp.headers["location"]).query)
     assert params["error"] == ["invalid_scope"]
 

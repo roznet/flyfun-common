@@ -51,7 +51,7 @@ def _oauth_error_redirect(
         params["state"] = state
     sep = "&" if "?" in redirect_uri else "?"
     return RedirectResponse(
-        url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=302
+        url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=303
     )
 
 
@@ -340,7 +340,7 @@ def create_oauth_router(
             params["state"] = state
         sep = "&" if "?" in redirect_uri else "?"
         return RedirectResponse(
-            url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=302
+            url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=303
         )
 
     # ---- Token Endpoint ----
