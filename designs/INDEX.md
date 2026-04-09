@@ -17,3 +17,8 @@ Key exports: `create_auth_router`, `create_token`, `decode_token`, `COOKIE_NAME`
 Shared SQLAlchemy models (UserRow, ApiTokenRow), database engine singleton, and FastAPI dependencies for session management and authentication.
 Key exports: `UserRow`, `ApiTokenRow`, `Base`, `get_db`, `current_user_id`, `init_shared_db`, `ensure_dev_user`, `SessionLocal`
 → Full doc: db.md
+
+### autorouter
+OAuth2 account linking for Autorouter API access (NOTAMs, flight plans, weather). Service-linking flow for already-authenticated users — not a login provider.
+Key exports: `create_autorouter_router`, `get_autorouter_token`
+→ Full doc: autorouter.md
