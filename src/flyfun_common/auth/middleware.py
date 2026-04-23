@@ -16,9 +16,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from flyfun_common.auth.config import (
     COOKIE_NAME,
-    get_cookie_domain,
     get_jwt_secret,
-    is_dev_mode,
+    get_session_cookie_attrs,
 )
 from flyfun_common.auth.jwt_utils import (
     create_token,
@@ -129,16 +128,15 @@ def _response_sets_session_cookie(headers: list[tuple[bytes, bytes]]) -> bool:
 
 
 def _build_cookie_header(token: str, max_age: int) -> str:
-    parts = [
-        f"{COOKIE_NAME}={token}",
-        f"Max-Age={max_age}",
-        "Path=/",
-        "HttpOnly",
-        "SameSite=lax",
-    ]
-    domain = get_cookie_domain()
-    if domain:
-        parts.append(f"Domain={domain}")
-    if not is_dev_mode():
+    attrs = get_session_cookie_attrs()
+    parts = [f"{COOKIE_NAME}={token}", f"Max-Age={max_age}", f"Path={attrs['path']}"]
+    if attrs.get("httponly"):
+        parts.append("HttpOnly")
+    samesite = attrs.get("samesite")
+    if samesite:
+        parts.append(f"SameSite={samesite}")
+    if "domain" in attrs:
+        parts.append(f"Domain={attrs['domain']}")
+    if attrs.get("secure"):
         parts.append("Secure")
     return "; ".join(parts)
