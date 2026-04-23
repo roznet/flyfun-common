@@ -29,6 +29,25 @@ def get_cookie_domain() -> str | None:
     return os.environ.get("COOKIE_DOMAIN", ".flyfun.aero")
 
 
+def get_session_cookie_attrs() -> dict:
+    """Policy attributes for the `flyfun_auth` cookie (no name/value/max_age).
+
+    Single source of truth consumed by:
+      * `router._set_session_cookie` — splatted into `response.set_cookie`.
+      * `middleware._build_cookie_header` — rendered into a raw Set-Cookie.
+    """
+    attrs: dict = {
+        "path": "/",
+        "httponly": True,
+        "samesite": "lax",
+        "secure": not is_dev_mode(),
+    }
+    domain = get_cookie_domain()
+    if domain:
+        attrs["domain"] = domain
+    return attrs
+
+
 def get_jwt_secret() -> str:
     secret = os.environ.get("JWT_SECRET")
     if secret:

@@ -31,6 +31,7 @@ from flyfun_common.auth.config import (
     create_oauth,
     get_cookie_domain,
     get_jwt_secret,
+    get_session_cookie_attrs,
     is_dev_mode,
 )
 from flyfun_common.auth.jwt_utils import create_token, get_jwt_cookie_max_age
@@ -426,14 +427,9 @@ def create_auth_router(
 
 
 def _set_session_cookie(response: RedirectResponse, token: str) -> None:
-    secure = not is_dev_mode()
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
-        httponly=True,
-        samesite="lax",
-        secure=secure,
-        path="/",
-        domain=get_cookie_domain(),
         max_age=get_jwt_cookie_max_age(),
+        **get_session_cookie_attrs(),
     )
