@@ -9,8 +9,8 @@ Related: flyfun-weather, flyfun-customs
 ## Modules
 
 ### auth
-Google OAuth login, JWT session cookies, cross-subdomain SSO via `.flyfun.aero` cookie domain. Provides a mountable FastAPI auth router and configuration helpers.
-Key exports: `create_auth_router`, `create_token`, `decode_token`, `COOKIE_NAME`, `get_jwt_secret`, `is_dev_mode`
+Google/Apple OAuth login, JWT session cookies, rolling sessions, cross-subdomain SSO via `.flyfun.aero` cookie domain, and post-login `?next=` redirects. Provides a mountable FastAPI auth router, the `SlidingSessionMiddleware`, and configuration helpers.
+Key exports: `create_auth_router`, `SlidingSessionMiddleware`, `create_token`, `decode_token`, `COOKIE_NAME`, `get_jwt_secret`, `is_dev_mode`
 → Full doc: auth.md
 
 ### db

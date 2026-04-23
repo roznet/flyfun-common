@@ -33,7 +33,7 @@ from flyfun_common.auth.config import (
     get_jwt_secret,
     is_dev_mode,
 )
-from flyfun_common.auth.jwt_utils import create_token
+from flyfun_common.auth.jwt_utils import create_token, get_jwt_cookie_max_age
 from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
 
@@ -42,6 +42,26 @@ logger = logging.getLogger(__name__)
 # Apple's JWKS endpoint for verifying identity tokens
 _APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 _apple_jwks_client: pyjwt.PyJWKClient | None = None
+
+
+def _is_safe_relative_path(value: str) -> bool:
+    """True if `value` is a safe same-origin redirect target.
+
+    Blocks open-redirect vectors: absolute URLs, protocol-relative `//host`,
+    backslash-prefixed `/\\host` (some browsers normalize this to `//host`),
+    and anything with a scheme or netloc.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if not value.startswith("/"):
+        return False
+    if value.startswith("//") or value.startswith("/\\"):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme == "" and parsed.netloc == ""
 
 
 def _get_apple_jwks_client() -> pyjwt.PyJWKClient:
@@ -178,6 +198,7 @@ def create_auth_router(
         request: Request,
         platform: str | None = None,
         scheme: str | None = None,
+        next: str | None = None,
     ):
         if provider not in SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
@@ -194,6 +215,10 @@ def create_auth_router(
                     detail="Invalid URL scheme",
                 )
             request.session["oauth_scheme"] = scheme
+        # Post-login redirect — honored only on browser/web flow, not native iOS.
+        # Silently dropped if it doesn't pass open-redirect validation.
+        if next and platform != "ios" and _is_safe_relative_path(next):
+            request.session["post_login_redirect"] = next
         return await client.authorize_redirect(request, redirect_uri)
 
     @router.get("/callback/{provider}")
@@ -250,6 +275,8 @@ def create_auth_router(
 
         # iOS/native app: redirect to app-specific custom URL scheme
         platform = request.session.pop("oauth_platform", None)
+        # iOS flow doesn't honor post-login redirect — the app owns navigation.
+        post_login_redirect = request.session.pop("post_login_redirect", None)
         if platform == "ios":
             scheme = request.session.pop("oauth_scheme", "flyfun")
             redirect_url = f"{scheme}://auth/callback?token={quote(jwt_token)}"
@@ -262,7 +289,9 @@ def create_auth_router(
             _set_session_cookie(response, jwt_token)
             return response
 
-        response = RedirectResponse(url="/", status_code=302)
+        # Deep-link return from consumer app: validated at stash time.
+        target = post_login_redirect if post_login_redirect and _is_safe_relative_path(post_login_redirect) else "/"
+        response = RedirectResponse(url=target, status_code=302)
         _set_session_cookie(response, jwt_token)
         return response
 
@@ -406,5 +435,5 @@ def _set_session_cookie(response: RedirectResponse, token: str) -> None:
         secure=secure,
         path="/",
         domain=get_cookie_domain(),
-        max_age=7 * 24 * 3600,
+        max_age=get_jwt_cookie_max_age(),
     )
