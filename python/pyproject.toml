@@ -42,7 +42,7 @@ Homepage = "https://flyfun.aero"
 Repository = "https://github.com/roznet/flyfun-common"
 
 [tool.hatch.build.targets.sdist]
-exclude = ["tests/", "designs/", ".pytest_cache/"]
+exclude = ["tests/", ".pytest_cache/"]
 
 [tool.hatch.build.targets.wheel]
-exclude = ["tests/", "designs/"]
+exclude = ["tests/"]
