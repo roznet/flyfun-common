@@ -62,6 +62,11 @@ def _session_cookie_from(response) -> str | None:
     return None
 
 
+def _renewed_token_from(response) -> str | None:
+    """Pull the X-Renewed-Token header from a response, if any."""
+    return response.headers.get("x-renewed-token")
+
+
 # ---------- _is_safe_relative_path ----------
 
 @pytest.mark.parametrize(
@@ -164,10 +169,63 @@ def test_middleware_no_cookie_no_refresh():
     secret = "test-secret-nocookie"
     app = _app_with_middleware(secret)
     client = TestClient(app)
-    # Simulate bearer-token call: no cookie, just an Authorization header.
+    # Garbage Bearer that can't be decoded → middleware is a no-op.
     resp = client.get("/echo", headers={"Authorization": "Bearer ff_does_not_matter"})
     assert resp.status_code == 200
     assert _session_cookie_from(resp) is None
+    assert _renewed_token_from(resp) is None
+
+
+def test_middleware_refreshes_bearer_near_expiry():
+    secret = "test-secret-bearer-near"
+    app = _app_with_middleware(secret)
+    client = TestClient(app)
+    token = _forge_token(secret, exp_in=timedelta(days=5))  # < 15-day threshold
+    resp = client.get("/echo", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    new_token = _renewed_token_from(resp)
+    assert new_token is not None
+    assert new_token != token
+    old_payload = pyjwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+    new_payload = pyjwt.decode(new_token, secret, algorithms=[JWT_ALGORITHM])
+    assert new_payload["sub"] == old_payload["sub"]
+    assert new_payload["exp"] > old_payload["exp"]
+    # Bearer flow must not also emit a session cookie.
+    assert _session_cookie_from(resp) is None
+
+
+def test_middleware_skips_fresh_bearer():
+    secret = "test-secret-bearer-fresh"
+    app = _app_with_middleware(secret)
+    client = TestClient(app)
+    token = _forge_token(secret, exp_in=timedelta(days=25))  # > 15-day threshold
+    resp = client.get("/echo", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert _renewed_token_from(resp) is None
+
+
+def test_middleware_ignores_expired_bearer():
+    secret = "test-secret-bearer-expired"
+    app = _app_with_middleware(secret)
+    client = TestClient(app)
+    token = _forge_token(secret, exp_in=timedelta(seconds=-60))
+    resp = client.get("/echo", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert _renewed_token_from(resp) is None
+
+
+def test_middleware_cookie_takes_precedence_over_bearer():
+    """If a request carries both, the cookie path wins (browser flow owns cookies)."""
+    secret = "test-secret-both"
+    app = _app_with_middleware(secret)
+    client = TestClient(app)
+    cookie_token = _forge_token(secret, exp_in=timedelta(days=5), sub="cookie-user")
+    bearer_token = _forge_token(secret, exp_in=timedelta(days=5), sub="bearer-user")
+    client.cookies.set(COOKIE_NAME, cookie_token)
+    resp = client.get("/echo", headers={"Authorization": f"Bearer {bearer_token}"})
+    assert resp.status_code == 200
+    assert _session_cookie_from(resp) is not None
+    assert _renewed_token_from(resp) is None
 
 
 def test_middleware_does_not_overwrite_response_cookie():

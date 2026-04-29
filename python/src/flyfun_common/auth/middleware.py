@@ -1,9 +1,29 @@
-"""Sliding-session middleware: refresh JWT cookie when nearing expiry.
+"""Sliding-session middleware: refresh JWT when nearing expiry.
 
 Stateless rolling sessions — a user who stays active keeps rolling forward
 indefinitely (up to the absolute JWT expiry window). Decodes the incoming
-cookie and, when the remaining lifetime drops below the refresh threshold,
-attaches a fresh cookie to the outgoing response.
+credential and, when the remaining lifetime drops below the refresh
+threshold, attaches a fresh token to the outgoing response.
+
+Two transports are supported:
+  * Cookie (`flyfun_auth`) — refreshed via `Set-Cookie`.
+  * Bearer (`Authorization: Bearer <jwt>`) — refreshed via the
+    `X-Renewed-Token` response header. Native clients (iOS / macOS) read
+    the header and overwrite their stored JWT, mirroring the cookie
+    behaviour for browsers.
+
+If both a cookie and a Bearer token are present on the request, the cookie
+takes precedence and only `Set-Cookie` is emitted (matches the assumption
+that browser flows own the cookie path).
+
+For browsers consuming `X-Renewed-Token` from a different origin, expose
+the header via CORS in the host app:
+
+    app.add_middleware(
+        CORSMiddleware,
+        ...,
+        expose_headers=["X-Renewed-Token"],
+    )
 """
 
 from __future__ import annotations
@@ -28,21 +48,26 @@ from flyfun_common.auth.jwt_utils import (
 
 logger = logging.getLogger(__name__)
 
+RENEWED_TOKEN_HEADER = "X-Renewed-Token"
+
 
 class SlidingSessionMiddleware:
-    """Refresh the flyfun_auth cookie when it's close to expiring.
+    """Refresh the user's JWT when it's close to expiring.
 
-    Mount in each FastAPI app that issues flyfun_auth cookies:
+    Mount in each FastAPI app that issues flyfun_auth credentials:
 
         app.add_middleware(SlidingSessionMiddleware)
 
     Behavior:
-      * Only fires on HTTP requests that carry a still-valid flyfun_auth cookie.
+      * Fires on HTTP requests carrying either a still-valid `flyfun_auth`
+        cookie or an `Authorization: Bearer <jwt>` header.
       * Refreshes when the token's remaining lifetime is below
         JWT_REFRESH_THRESHOLD_DAYS (default 15).
-      * Bearer-token requests are left untouched (nothing to rewrite).
-      * If the outgoing response already sets flyfun_auth (login callback,
-        logout, account delete), the refresh is skipped so we don't clobber it.
+      * Cookie input → `Set-Cookie: flyfun_auth=…` on the response.
+      * Bearer input → `X-Renewed-Token: <jwt>` on the response.
+      * If the response already sets the corresponding header itself
+        (login callback, logout, account delete, manual rotation), the
+        refresh is skipped so we don't clobber it.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -55,30 +80,56 @@ class SlidingSessionMiddleware:
             await self.app(scope, receive, send)
             return
 
-        refreshed = self._maybe_build_refresh(scope)
-        if refreshed is None:
+        action = self._maybe_refresh_action(scope)
+        if action is None:
             await self.app(scope, receive, send)
             return
 
-        cookie_header = refreshed.encode("latin-1")
+        transport, value = action
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
-                if not _response_sets_session_cookie(headers):
-                    headers.append((b"set-cookie", cookie_header))
-                    message = {**message, "headers": headers}
+                if transport == "cookie":
+                    if not _response_sets_session_cookie(headers):
+                        headers.append((b"set-cookie", value.encode("latin-1")))
+                        message = {**message, "headers": headers}
+                else:  # bearer
+                    if not _response_sets_renewed_token(headers):
+                        headers.append(
+                            (RENEWED_TOKEN_HEADER.lower().encode("latin-1"),
+                             value.encode("latin-1"))
+                        )
+                        message = {**message, "headers": headers}
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
 
-    def _maybe_build_refresh(self, scope: Scope) -> str | None:
+    def _maybe_refresh_action(self, scope: Scope) -> tuple[str, str] | None:
         cookie = _extract_cookie(scope, COOKIE_NAME)
-        if not cookie:
-            return None
+        if cookie:
+            new_token = self._maybe_refresh_token(cookie)
+            if new_token is None:
+                return None
+            return ("cookie", _build_cookie_header(new_token, get_jwt_cookie_max_age()))
 
+        bearer = _extract_bearer(scope)
+        if bearer:
+            new_token = self._maybe_refresh_token(bearer)
+            if new_token is None:
+                return None
+            return ("bearer", new_token)
+
+        return None
+
+    def _maybe_refresh_token(self, current_token: str) -> str | None:
+        """Decode `current_token` and mint a successor if it's near expiry.
+
+        Returns None when the token can't be decoded, has no exp/sub, is
+        outside the refresh window, or when re-issuance fails.
+        """
         try:
-            payload = decode_token(cookie, get_jwt_secret())
+            payload = decode_token(current_token, get_jwt_secret())
         except pyjwt.PyJWTError:
             return None
 
@@ -93,7 +144,7 @@ class SlidingSessionMiddleware:
             return None
 
         try:
-            new_token = create_token(
+            return create_token(
                 sub,
                 payload.get("email", ""),
                 payload.get("name", ""),
@@ -104,8 +155,6 @@ class SlidingSessionMiddleware:
                 "SlidingSessionMiddleware failed to refresh token", exc_info=True
             )
             return None
-
-        return _build_cookie_header(new_token, get_jwt_cookie_max_age())
 
 
 def _extract_cookie(scope: Scope, name: str) -> str | None:
@@ -119,10 +168,29 @@ def _extract_cookie(scope: Scope, name: str) -> str | None:
     return None
 
 
+def _extract_bearer(scope: Scope) -> str | None:
+    for key, value in scope.get("headers", []):
+        if key != b"authorization":
+            continue
+        decoded = value.decode("latin-1").strip()
+        if decoded.lower().startswith("bearer "):
+            token = decoded[7:].strip()
+            return token or None
+    return None
+
+
 def _response_sets_session_cookie(headers: list[tuple[bytes, bytes]]) -> bool:
     prefix = f"{COOKIE_NAME}=".encode("latin-1")
     for key, value in headers:
         if key == b"set-cookie" and value.startswith(prefix):
+            return True
+    return False
+
+
+def _response_sets_renewed_token(headers: list[tuple[bytes, bytes]]) -> bool:
+    target = RENEWED_TOKEN_HEADER.lower().encode("latin-1")
+    for key, _value in headers:
+        if key == target:
             return True
     return False
 
