@@ -43,7 +43,7 @@ public actor RollingBearerSession {
     public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         var req = request
         if req.value(forHTTPHeaderField: "Authorization") == nil,
-           let token = await store.token {
+           let token = store.token {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
@@ -62,12 +62,12 @@ public actor RollingBearerSession {
         if let renewed = http.value(forHTTPHeaderField: Self.renewedTokenHeader),
            !renewed.isEmpty {
             Self.logger.debug("Rolling JWT forward via \(Self.renewedTokenHeader)")
-            await store.setToken(renewed)
+            store.token = renewed
         }
 
         if http.statusCode == 401 {
             Self.logger.info("401 from \(req.url?.absoluteString ?? "unknown") — clearing token")
-            await store.setToken(nil)
+            store.token = nil
             await onUnauthorized?()
             throw FlyFunAPIError.unauthorized
         }

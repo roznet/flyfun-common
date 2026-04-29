@@ -81,8 +81,7 @@ struct RollingBearerSessionTests {
         defer { StubURLProtocol.setHandler(nil) }
 
         _ = try await rolling.data(for: URLRequest(url: url))
-        let stored = await store.token
-        #expect(stored == "new")
+        #expect(store.token == "new")
     }
 
     @Test func unauthorizedClearsStoreFiresCallbackAndThrows() async throws {
@@ -98,9 +97,8 @@ struct RollingBearerSessionTests {
         await #expect(throws: FlyFunAPIError.self) {
             _ = try await rolling.data(for: URLRequest(url: url))
         }
-        let stored = await store.token
         let fired = await box.fired
-        #expect(stored == nil)
+        #expect(store.token == nil)
         #expect(fired == true)
     }
 
