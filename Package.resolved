@@ -1,0 +1,24 @@
+{
+  "originHash" : "335d827767d53974003096be228a736eca4b6d4ddedb5e990fedfd12e2e8f7a8",
+  "pins" : [
+    {
+      "identity" : "fmdb",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ccgus/fmdb",
+      "state" : {
+        "revision" : "1227a3fa2b9916bfd75fe380eb45cd210e69e251",
+        "version" : "2.7.12"
+      }
+    },
+    {
+      "identity" : "rzutils",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/roznet/rzutils",
+      "state" : {
+        "revision" : "4ddf6c0ae146b801b5fd62d1baed77caa7193c96",
+        "version" : "1.0.29"
+      }
+    }
+  ],
+  "version" : 3
+}

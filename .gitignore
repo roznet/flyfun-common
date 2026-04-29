@@ -9,3 +9,9 @@ data/
 .venv/
 venv/
 tmp
+
+# Swift / SwiftPM
+.build/
+.swiftpm/
+xcuserdata/
+DerivedData/
