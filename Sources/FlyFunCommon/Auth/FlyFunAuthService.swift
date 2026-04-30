@@ -8,6 +8,11 @@ import UIKit
 import AppKit
 #endif
 
+// Module-scope so it stays nonisolated and can be touched from the
+// ASWebAuthenticationSession completion handler (which runs on Apple's
+// XPC queue, not MainActor).
+private let logger = Logger(subsystem: "aero.flyfun.common", category: "FlyFunAuthService")
+
 /// OAuth + Apple Sign-In client for flyfun-common-protected servers.
 ///
 /// Hosts a single instance per app, configured with the server's base URL
@@ -26,8 +31,6 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
             self.callbackScheme = callbackScheme
         }
     }
-
-    private static let logger = Logger(subsystem: "aero.flyfun.common", category: "FlyFunAuthService")
 
     public let config: Config
 
@@ -51,15 +54,21 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         ]
 
         guard let url = components.url else { throw URLError(.badURL) }
-        Self.logger.info("Starting OAuth flow (\(provider)) to \(url)")
+        logger.info("Starting OAuth flow (\(provider)) to \(url)")
 
         let callbackURL: URL = try await withCheckedThrowingContinuation { continuation in
+            // The completion handler is invoked by ASWebAuthenticationSession on
+            // its own XPC queue — must NOT inherit MainActor isolation from this
+            // @MainActor class, or the Swift 6 runtime trips on
+            // _swift_task_checkIsolatedSwift. @Sendable strips the inherited
+            // isolation; we keep all touched state inside the closure (the
+            // continuation is Sendable, the logger is Sendable).
             let session = ASWebAuthenticationSession(
                 url: url,
                 callback: .customScheme(config.callbackScheme)
-            ) { url, error in
+            ) { @Sendable url, error in
                 if let error {
-                    Self.logger.error("OAuth error: \(error.localizedDescription)")
+                    logger.error("OAuth error: \(error.localizedDescription)")
                     continuation.resume(throwing: error)
                 } else if let url {
                     continuation.resume(returning: url)
@@ -75,7 +84,7 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
 
         let parser = AuthCallbackParser(customScheme: config.callbackScheme)
         guard let token = parser.token(from: callbackURL) else {
-            Self.logger.error("No token in callback URL: \(callbackURL)")
+            logger.error("No token in callback URL: \(callbackURL)")
             throw URLError(.userAuthenticationRequired)
         }
         return token
@@ -89,7 +98,7 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         guard let identityTokenData = credential.identityToken,
               let identityToken = String(data: identityTokenData, encoding: .utf8)
         else {
-            Self.logger.error("No identity token in Apple credential")
+            logger.error("No identity token in Apple credential")
             throw URLError(.userAuthenticationRequired)
         }
 
@@ -126,7 +135,7 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         }
         guard http.statusCode == 200 else {
             let detail = String(data: data, encoding: .utf8) ?? "Unknown error"
-            Self.logger.error("Apple token exchange failed (\(http.statusCode)): \(detail)")
+            logger.error("Apple token exchange failed (\(http.statusCode)): \(detail)")
             throw URLError(.userAuthenticationRequired)
         }
 
@@ -155,7 +164,7 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         }
         guard http.statusCode == 204 else {
             let detail = String(data: data, encoding: .utf8) ?? "Unknown error"
-            Self.logger.error("Account deletion failed (\(http.statusCode)): \(detail)")
+            logger.error("Account deletion failed (\(http.statusCode)): \(detail)")
             throw URLError(.badServerResponse)
         }
     }
