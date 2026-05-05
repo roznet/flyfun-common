@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "FlyFunCommon",
     platforms: [
-        .macOS(.v26), .iOS(.v26)
+        .macOS(.v26), .iOS("18.6")
     ],
     products: [
         .library(
