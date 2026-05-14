@@ -147,6 +147,62 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         return token
     }
 
+    // MARK: - Magic-link (email OTP)
+
+    /// Requests a magic-link email containing a 6-digit OTP. Server always
+    /// responds 200 (no account enumeration); a non-200 response means a
+    /// real failure (rate-limit, Apple Private Relay, etc.).
+    public func requestMagicLinkCode(email: String) async throws {
+        let url = config.baseURL.appendingPathComponent("auth/magic-link/request")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: String] = [
+            "email": email,
+            "platform": "ios",
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard http.statusCode == 200 else {
+            let detail = String(data: data, encoding: .utf8) ?? "Unknown error"
+            logger.error("Magic-link request failed (\(http.statusCode)): \(detail)")
+            throw URLError(.badServerResponse)
+        }
+    }
+
+    /// Exchanges the email + 6-digit OTP code for a JWT. The returned
+    /// token can be stored in `KeychainBearerTokenStore` directly.
+    public func consumeMagicLinkCode(email: String, code: String) async throws -> String {
+        let url = config.baseURL.appendingPathComponent("auth/magic-link/consume-code")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: String] = ["email": email, "code": code]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard http.statusCode == 200 else {
+            let detail = String(data: data, encoding: .utf8) ?? "Unknown error"
+            logger.error("Magic-link consume failed (\(http.statusCode)): \(detail)")
+            throw URLError(.userAuthenticationRequired)
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = json["token"] as? String
+        else {
+            throw URLError(.cannotParseResponse)
+        }
+        return token
+    }
+
     // MARK: - Account deletion
 
     /// Permanently deletes the authenticated user on the server. Caller is

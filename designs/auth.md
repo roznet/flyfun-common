@@ -1,6 +1,6 @@
 # Auth Module
 
-> Google OAuth, JWT sessions, and cross-subdomain SSO for all flyfun services
+> Google/Apple OAuth, magic-link email, JWT sessions, and cross-subdomain SSO for all flyfun services
 
 ## Intent
 
@@ -15,7 +15,9 @@ auth/
 ├── config.py      # COOKIE_NAME, JWT_SECRET, OAuth setup, dev mode
 ├── jwt_utils.py   # create_token / decode_token (HS256, configurable expiry)
 ├── middleware.py  # SlidingSessionMiddleware — rolling cookie refresh
-└── router.py      # create_auth_router() → FastAPI APIRouter
+├── router.py      # create_auth_router() → FastAPI APIRouter
+├── magic_link.py  # email magic-link + OTP sub-router & helpers
+└── rate_limit.py  # DB-backed sliding-window limits for magic-link
 ```
 
 ### SSO Mechanism
@@ -50,6 +52,49 @@ GET /auth/login/google → Google consent → GET /auth/callback/google
 ```
 
 iOS variant: `?platform=ios` on login → callback redirects to `flyfun://auth/callback?token=...` instead of setting cookie.
+
+### Magic-link (email) flow
+
+A third login provider alongside Google/Apple. Mints the same `flyfun_auth` JWT — only the identification path differs. Mounted by `create_auth_router()` only when a `send_magic_link_email` callback is wired:
+
+```python
+def send_magic_link_email(email, link, code, requesting_ip):
+    # app-specific email infra (Resend / SMTP / SES …)
+    ...
+
+app.include_router(create_auth_router(
+    send_magic_link_email=send_magic_link_email,
+))
+```
+
+Endpoints (all prefixed `/auth`):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /magic-link/request` | Body `{email, platform?, next?}`. Mints a 256-bit token + 6-digit OTP, stores SHA-256 hashes only, calls `send_magic_link_email`. **Always returns 200** (no account enumeration). 503 if no callback. 400 for Apple Private Relay addresses. 429 on rate-limit. |
+| `GET  /verify?token=...&next=...` | Pass-through page. **Does NOT consume the token.** 302s to `/auth-verify.html?token=...&next=...`. Each consumer app owns that page. Defends against corporate email scanners (Outlook ATP, Proofpoint, Mimecast) that pre-click links. |
+| `POST /magic-link/consume` | Web flow. Body `{token, next?}`. Validates, marks `used_at`, mints JWT, sets `flyfun_auth` cookie, redirects to `next` or `/`. Unapproved users → 302 `/login.html?status=pending`. |
+| `POST /magic-link/consume-code` | iOS flow. Body `{email, code}`. Same validation logic, returns `{token, user_id}` JSON (no cookie). Mirrors `/auth/apple/token`. |
+
+Account-linking rule: `_find_or_create_user_by_email` looks up by lowercased email. Existing rows keep their original `provider` (a Google user verifying via magic-link stays `provider="google"`). New rows are created with `provider="email"`, `provider_sub=<email>`, `approved=True`.
+
+**Rate limits** (DB-backed sliding windows, skipped when `is_dev_mode()`):
+
+- per email: 3 / hour on `/magic-link/request`
+- per IP:   10 / hour on `/magic-link/request`
+- per IP:    5 / minute on `/magic-link/consume*`
+
+Counters run as `count(*)` over `magic_link_tokens.created_at` (for /request) and `magic_link_consume_attempts.attempted_at` (for /consume). No separate counter table.
+
+**Token cleanup**: `purge_expired_magic_link_tokens(db, older_than_hours=24)` deletes expired tokens and old consume-attempt rows. flyfun-common does NOT schedule — consumer apps call this from their own retention loop.
+
+**Consumer-app responsibilities** (not in flyfun-common):
+
+1. **Alembic migration** for `magic_link_tokens` + `magic_link_consume_attempts` tables, plus a `ix_users_email` index on `users.email` (every consume reads it).
+2. **Email template** + `send_magic_link_email` callback wired into `create_auth_router`.
+3. **`/login.html`** showing an email-input form that POSTs to `/auth/magic-link/request`.
+4. **`/auth-verify.html`** confirmation page that POSTs to `/auth/magic-link/consume`.
+5. **Retention loop** call to `purge_expired_magic_link_tokens`.
 
 ### Post-login redirect (`?next=`)
 
@@ -106,6 +151,8 @@ def my_data(user_id: str = Depends(current_user_id), db=Depends(get_db)):
 - **Auto-approve on signup**: New Google OAuth users get `approved=True`. Admin can revoke later.
 - **API token prefix `ff_`**: Distinguishes hashed API tokens from JWTs in Bearer header. Previously `wb_` in weather — unified to `ff_` (flyfun).
 - **`on_new_user` callback**: Avoids coupling the router to app-specific logic (emails, provisioning).
+- **Magic-link provider gated by callback presence**: `/auth/providers` lists `"email"` iff `send_magic_link_email` was wired in `create_auth_router`. Mirrors how Google/Apple gate on env-var presence — one source of truth, no extra env var.
+- **`GET /auth/verify` never consumes**: Corporate email scanners pre-click links. Only the explicit POST from `/auth-verify.html` burns the token. The verify endpoint is a thin 302 redirect.
 
 ## Gotchas
 
@@ -132,5 +179,7 @@ def my_data(user_id: str = Depends(current_user_id), db=Depends(get_db)):
 - JWT: `src/flyfun_common/auth/jwt_utils.py`
 - Middleware: `src/flyfun_common/auth/middleware.py`
 - Router: `src/flyfun_common/auth/router.py`
+- Magic-link: `src/flyfun_common/auth/magic_link.py`
+- Rate limits: `src/flyfun_common/auth/rate_limit.py`
 - Auth deps: `src/flyfun_common/db/deps.py`
-- See [DB design](./db.md) for UserRow and ApiTokenRow models
+- See [DB design](./db.md) for UserRow, ApiTokenRow, MagicLinkTokenRow models

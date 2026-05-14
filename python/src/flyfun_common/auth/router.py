@@ -164,6 +164,7 @@ class AppleTokenRequest(BaseModel):
 def create_auth_router(
     on_new_user: callable | None = None,
     on_delete_user: callable | None = None,
+    send_magic_link_email: callable | None = None,
 ) -> APIRouter:
     """Create an auth router.
 
@@ -172,9 +173,15 @@ def create_auth_router(
                      called after a new user is created (e.g. send welcome email).
         on_delete_user: Optional callback(user_id: str, db: Session) called before
                         deleting a user, so apps can clean up app-specific data.
+        send_magic_link_email: Optional callback
+                     (email, link, code, requesting_ip) -> None. Wiring it in
+                     enables the magic-link sign-in path and lists ``email``
+                     in ``/auth/providers``. Apps supply this from their own
+                     email infra; flyfun-common stays mail-stack agnostic.
     """
     router = APIRouter(prefix="/auth", tags=["auth"])
     oauth = create_oauth()
+    magic_link_enabled = send_magic_link_email is not None
 
     def _get_oauth_client(provider: str):
         """Get a registered OAuth client, or raise 404."""
@@ -188,10 +195,14 @@ def create_auth_router(
 
     @router.get("/providers")
     async def list_providers():
-        """Return the list of configured OAuth providers."""
+        """Return the list of configured auth providers."""
         from flyfun_common.auth.config import get_registered_providers
 
-        return {"providers": get_registered_providers(oauth)}
+        return {
+            "providers": get_registered_providers(
+                oauth, magic_link_enabled=magic_link_enabled
+            )
+        }
 
     @router.get("/login/{provider}")
     async def login(
@@ -423,10 +434,24 @@ def create_auth_router(
         response.delete_cookie(COOKIE_NAME, path="/", domain=get_cookie_domain())
         return response
 
+    # Mount magic-link sub-router only when an email callback is wired.
+    # The /request endpoint itself returns 503 if the callback is None, but
+    # gating the include keeps /auth/providers honest and avoids surprise
+    # endpoints when the feature is off.
+    if magic_link_enabled:
+        from flyfun_common.auth.magic_link import build_magic_link_router
+
+        router.include_router(
+            build_magic_link_router(
+                send_magic_link_email=send_magic_link_email,
+                on_new_user=on_new_user,
+            )
+        )
+
     return router
 
 
-def _set_session_cookie(response: RedirectResponse, token: str) -> None:
+def _set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,

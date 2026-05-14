@@ -15,7 +15,7 @@ COOKIE_DOMAIN: str | None = None  # computed at runtime
 _DEV_JWT_SECRET = "dev-insecure-jwt-secret-do-not-use-in-production"
 
 # Providers that can be registered
-SUPPORTED_PROVIDERS = ("google", "apple")
+SUPPORTED_PROVIDERS = ("google", "apple", "email")
 
 
 def is_dev_mode() -> bool:
@@ -135,6 +135,18 @@ def create_oauth() -> OAuth:
     return oauth
 
 
-def get_registered_providers(oauth: OAuth) -> list[str]:
-    """Return the list of provider names that were registered."""
-    return [p for p in SUPPORTED_PROVIDERS if hasattr(oauth, p)]
+def get_registered_providers(
+    oauth: OAuth, *, magic_link_enabled: bool = False
+) -> list[str]:
+    """Return the list of provider names that were registered.
+
+    OAuth providers (Google, Apple) are gated by their authlib registration
+    (which itself is gated by the matching client-id env var). The
+    ``email`` provider is gated by ``magic_link_enabled`` -- which
+    ``create_auth_router`` sets to True iff a ``send_magic_link_email``
+    callback was wired.
+    """
+    result = [p for p in SUPPORTED_PROVIDERS if p != "email" and hasattr(oauth, p)]
+    if magic_link_enabled:
+        result.append("email")
+    return result
