@@ -10,7 +10,7 @@ Provide the shared database layer that all flyfun apps connect to. Contains only
 
 ```
 db/
-├── models.py    # UserRow, ApiTokenRow, Base (DeclarativeBase)
+├── models.py    # UserRow, ApiTokenRow, MagicLinkTokenRow, …, Base
 ├── engine.py    # Singleton engine, init_shared_db, ensure_dev_user
 └── deps.py      # get_db(), current_user_id() FastAPI dependencies
 ```
@@ -60,6 +60,29 @@ db/
 | `reference_id` | String(128) | Nullable — app-level FK as string |
 
 Helper utilities in `flyfun_common.costs`: `record_cost()`, `get_total_cost()`, `get_cost_since()`, `check_budget()`, `get_cost_breakdown()`.
+
+**`magic_link_tokens`** — short-lived sign-in tokens for the magic-link auth path. Consumer apps add the migration; flyfun-common ships only the model.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | String(64) PK | UUID |
+| `email` | String(256) indexed | Lowercased on insert |
+| `token_hash` | String(64) unique+indexed | SHA-256 of raw token |
+| `otp_code_hash` | String(64) nullable | SHA-256 of 6-digit OTP (iOS path) |
+| `created_at` | DateTime(tz) indexed | For sliding-window rate limits |
+| `expires_at` | DateTime(tz) | created_at + 15 min |
+| `used_at` | DateTime(tz) nullable | Single-use marker |
+| `requested_ip` | String(64) nullable indexed | For per-IP rate limits |
+
+**`magic_link_consume_attempts`** — per-IP attempt log used by the consume-side rate limit. Pruned by `purge_expired_magic_link_tokens`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | Integer PK | Auto-increment |
+| `ip` | String(64) indexed | |
+| `attempted_at` | DateTime(tz) indexed | |
+
+Consumer apps **must add an `ix_users_email` index** on `users.email` in their migration. The magic-link consume path reads users by lowercased email; without an index this is a full scan.
 
 ### No ORM Relationships on Shared Models
 

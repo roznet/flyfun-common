@@ -70,6 +70,39 @@ class UserPreferencesRow(Base):
     app_prefs_json: Mapped[str] = mapped_column(Text, default="{}")
 
 
+class MagicLinkTokenRow(Base):
+    __tablename__ = "magic_link_tokens"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(256), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    otp_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    requested_ip: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None, index=True
+    )
+
+
+class MagicLinkConsumeAttemptRow(Base):
+    __tablename__ = "magic_link_consume_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ip: Mapped[str] = mapped_column(String(64), index=True)
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+
 class CostLedgerRow(Base):
     __tablename__ = "cost_ledger"
 
