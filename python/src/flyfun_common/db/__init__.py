@@ -6,6 +6,8 @@ from flyfun_common.db.models import (
     ApiTokenRow,
     UserPreferencesRow,
     CostLedgerRow,
+    MagicLinkTokenRow,
+    MagicLinkConsumeAttemptRow,
 )
 from flyfun_common.db.engine import (
     get_engine,
@@ -34,6 +36,8 @@ __all__ = [
     "ApiTokenRow",
     "UserPreferencesRow",
     "CostLedgerRow",
+    "MagicLinkTokenRow",
+    "MagicLinkConsumeAttemptRow",
     "get_engine",
     "reset_engine",
     "init_shared_db",
