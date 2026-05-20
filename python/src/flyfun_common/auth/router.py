@@ -73,6 +73,23 @@ def _get_apple_jwks_client() -> pyjwt.PyJWKClient:
     return _apple_jwks_client
 
 
+def _email_if_verified(claims: dict, email: str) -> str:
+    """Return ``email`` unless the provider explicitly marks it unverified.
+
+    Google sends a boolean ``email_verified``; Apple sends ``"true"``/``"false"``
+    (string or bool). A *missing* claim is treated as verified, to avoid
+    breaking providers that don't send it. An unverified email must never be
+    trusted for identity, admin-email matching, or magic-link account linking,
+    so we discard it — login still proceeds, just without an email.
+    """
+    if not email:
+        return email
+    verified = claims.get("email_verified", True)
+    if str(verified).strip().lower() in ("false", "0"):
+        return ""
+    return email
+
+
 def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
     """Extract (sub, email, display_name) from an OAuth token response.
 
@@ -85,7 +102,7 @@ def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
         # Apple puts claims in the id_token (parsed by authlib into userinfo)
         userinfo = token.get("userinfo") or {}
         sub = userinfo.get("sub", "")
-        email = userinfo.get("email", "")
+        email = _email_if_verified(userinfo, userinfo.get("email", ""))
         # Apple only sends the user's name on first authorization.
         # It comes as a JSON blob in the POST body 'user' parameter,
         # which authlib does NOT parse automatically — we handle it in
@@ -101,7 +118,8 @@ def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
     userinfo = token.get("userinfo")
     if not userinfo:
         raise ValueError(f"No userinfo in token from {provider}")
-    return userinfo["sub"], userinfo.get("email", ""), userinfo.get("name", "")
+    email = _email_if_verified(userinfo, userinfo.get("email", ""))
+    return userinfo["sub"], email, userinfo.get("name", "")
 
 
 def _find_or_create_user(
@@ -363,7 +381,7 @@ def create_auth_router(
             raise HTTPException(status_code=401, detail="Invalid identity token")
 
         sub = claims.get("sub", "")
-        email = claims.get("email", "")
+        email = _email_if_verified(claims, claims.get("email", ""))
         if not sub:
             raise HTTPException(status_code=400, detail="No subject in identity token")
 

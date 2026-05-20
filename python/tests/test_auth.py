@@ -30,6 +30,51 @@ def test_dev_mode_secret():
     assert secret  # should return dev default
 
 
+def test_is_dev_mode_known_values(monkeypatch):
+    from flyfun_common.auth.config import is_dev_mode
+
+    for v in ["development", "dev", "test", "testing", "local", "ci", ""]:
+        monkeypatch.setenv("ENVIRONMENT", v)
+        assert is_dev_mode() is True, v
+    for v in ["production", "prod", "Production", "PRODUCTION", " production "]:
+        monkeypatch.setenv("ENVIRONMENT", v)
+        assert is_dev_mode() is False, v
+
+
+def test_is_dev_mode_unset_defaults_dev(monkeypatch):
+    from flyfun_common.auth.config import is_dev_mode
+
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    assert is_dev_mode() is True
+
+
+def test_is_dev_mode_rejects_unknown_fail_closed(monkeypatch):
+    """A typo like 'staging' or garbage must NOT silently enable dev mode."""
+    from flyfun_common.auth.config import is_dev_mode as cfg_is_dev
+    from flyfun_common.db.engine import is_dev_mode as eng_is_dev
+
+    for v in ["staging", "pruduction", "produktion", "xyz", "stage"]:
+        monkeypatch.setenv("ENVIRONMENT", v)
+        with pytest.raises(RuntimeError):
+            cfg_is_dev()
+        with pytest.raises(RuntimeError):
+            eng_is_dev()  # parallel definition must behave identically
+
+
+def test_email_if_verified():
+    from flyfun_common.auth.router import _email_if_verified
+
+    # Missing claim → trusted (don't break providers that omit it)
+    assert _email_if_verified({}, "a@b.com") == "a@b.com"
+    assert _email_if_verified({"email_verified": True}, "a@b.com") == "a@b.com"
+    assert _email_if_verified({"email_verified": "true"}, "a@b.com") == "a@b.com"
+    # Explicitly unverified → dropped
+    assert _email_if_verified({"email_verified": False}, "a@b.com") == ""
+    assert _email_if_verified({"email_verified": "false"}, "a@b.com") == ""
+    # No email to begin with → unchanged
+    assert _email_if_verified({"email_verified": False}, "") == ""
+
+
 def test_shared_db_roundtrip(tmp_path):
     os.environ["ENVIRONMENT"] = "development"
     os.environ["DATA_DIR"] = str(tmp_path)

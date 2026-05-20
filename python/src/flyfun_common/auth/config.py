@@ -18,8 +18,29 @@ _DEV_JWT_SECRET = "dev-insecure-jwt-secret-do-not-use-in-production"
 SUPPORTED_PROVIDERS = ("google", "apple", "email")
 
 
+# Recognized environment names. Anything outside these sets is rejected so a
+# typo ("prod", "Production", "staging", …) can never SILENTLY fall through to
+# dev mode and enable the auth bypass — we fail closed and loud instead.
+# NOTE: duplicated verbatim in db/engine.py to avoid an auth<->db import cycle;
+# keep the two in sync.
+_DEV_ENVIRONMENTS = frozenset(
+    {"", "development", "dev", "test", "testing", "local", "ci"}
+)
+_PROD_ENVIRONMENTS = frozenset({"production", "prod"})
+
+
 def is_dev_mode() -> bool:
-    return os.environ.get("ENVIRONMENT", "development") != "production"
+    raw = os.environ.get("ENVIRONMENT", "development")
+    env = (raw or "").strip().lower()
+    if env in _PROD_ENVIRONMENTS:
+        return False
+    if env in _DEV_ENVIRONMENTS:
+        return True
+    raise RuntimeError(
+        f"Unrecognized ENVIRONMENT={raw!r}; expected 'production' or one of "
+        f"{sorted(e for e in _DEV_ENVIRONMENTS if e)}. Refusing to start to "
+        "avoid silently enabling the dev auth bypass."
+    )
 
 
 def get_cookie_domain() -> str | None:

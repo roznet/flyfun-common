@@ -18,9 +18,26 @@ SessionLocal: sessionmaker[Session] = sessionmaker()
 
 DEV_USER_ID = "dev-user-001"
 
+# Kept in sync with auth/config.py (duplicated to avoid an auth<->db import
+# cycle). Unknown ENVIRONMENT values fail closed rather than enabling dev mode.
+_DEV_ENVIRONMENTS = frozenset(
+    {"", "development", "dev", "test", "testing", "local", "ci"}
+)
+_PROD_ENVIRONMENTS = frozenset({"production", "prod"})
+
 
 def is_dev_mode() -> bool:
-    return os.environ.get("ENVIRONMENT", "development") != "production"
+    raw = os.environ.get("ENVIRONMENT", "development")
+    env = (raw or "").strip().lower()
+    if env in _PROD_ENVIRONMENTS:
+        return False
+    if env in _DEV_ENVIRONMENTS:
+        return True
+    raise RuntimeError(
+        f"Unrecognized ENVIRONMENT={raw!r}; expected 'production' or one of "
+        f"{sorted(e for e in _DEV_ENVIRONMENTS if e)}. Refusing to start to "
+        "avoid silently enabling the dev auth bypass."
+    )
 
 
 def get_engine(db_url: str | None = None) -> Engine:
