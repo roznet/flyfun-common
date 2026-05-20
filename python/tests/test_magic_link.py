@@ -441,6 +441,91 @@ def test_consume_code_wrong_code_400(dev_env):
     assert resp.status_code == 400
 
 
+def test_consume_code_otp_attempt_cap_burns_token(dev_env):
+    """After MAX_OTP_ATTEMPTS wrong guesses the token is burned, so even the
+    correct code no longer works. This is the per-token brute-force cap; it
+    holds regardless of the per-IP limiter (which is skipped in dev)."""
+    from flyfun_common.auth.magic_link import MAX_OTP_ATTEMPTS
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import MagicLinkTokenRow
+
+    app = _build_app(send_callback=lambda *a, **k: None)
+    client = TestClient(app)
+    _seed_token("brute@example.com")  # correct OTP is 123456
+
+    for _ in range(MAX_OTP_ATTEMPTS):
+        r = client.post(
+            "/auth/magic-link/consume-code",
+            json={"email": "brute@example.com", "code": "000000"},
+        )
+        assert r.status_code == 400
+
+    # Token is now burned — the correct code fails too.
+    r = client.post(
+        "/auth/magic-link/consume-code",
+        json={"email": "brute@example.com", "code": "123456"},
+    )
+    assert r.status_code == 400
+
+    session = SessionLocal()
+    try:
+        row = (
+            session.query(MagicLinkTokenRow)
+            .filter_by(email="brute@example.com")
+            .one()
+        )
+        assert row.attempt_count >= MAX_OTP_ATTEMPTS
+        assert row.used_at is not None
+    finally:
+        session.close()
+
+
+def test_consume_code_per_ip_limit_trips_in_prod(prod_env):
+    """Regression for the rollback bug: wrong-code attempts must PERSIST so the
+    per-IP consume limit actually trips. Before the fix every attempt returned
+    400 with zero attempt rows recorded, so the limit never fired."""
+    app = _build_app(send_callback=lambda *a, **k: None)
+    client = TestClient(app)
+    _seed_token("rl-consume@example.com")
+    statuses = [
+        client.post(
+            "/auth/magic-link/consume-code",
+            json={"email": "rl-consume@example.com", "code": "000000"},
+        ).status_code
+        for _ in range(8)
+    ]
+    assert 429 in statuses, statuses
+
+
+def test_client_ip_prefers_real_ip_then_rightmost_xff():
+    """The leftmost X-Forwarded-For is client-spoofable; we must trust
+    X-Real-IP or the rightmost (proxy-appended) XFF token instead."""
+    from starlette.requests import Request
+
+    from flyfun_common.auth.magic_link import _client_ip
+
+    def _req(headers: dict) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "headers": [
+                    (k.encode("latin-1"), v.encode("latin-1"))
+                    for k, v in headers.items()
+                ],
+                "client": ("10.0.0.9", 12345),
+            }
+        )
+
+    assert (
+        _client_ip(
+            _req({"x-real-ip": "9.9.9.9", "x-forwarded-for": "1.1.1.1, 2.2.2.2"})
+        )
+        == "9.9.9.9"
+    )
+    assert _client_ip(_req({"x-forwarded-for": "1.1.1.1, 2.2.2.2"})) == "2.2.2.2"
+    assert _client_ip(_req({})) == "10.0.0.9"
+
+
 # --- rate limiting (production-mode) -----------------------------------------
 
 

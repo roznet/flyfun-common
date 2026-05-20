@@ -392,6 +392,29 @@ def create_auth_router(
         response.delete_cookie(COOKIE_NAME, path="/", domain=get_cookie_domain())
         return response
 
+    @router.post("/logout-all")
+    async def logout_all(
+        user_id: str = Depends(current_user_id),
+        db: Session = Depends(get_db),
+    ):
+        """Revoke every outstanding session for the caller.
+
+        Bumps the user's session-epoch (``tokens_valid_after``) so all
+        previously-issued JWTs are rejected on next use — including ones a
+        thief may have copied and kept rolling forward via the sliding
+        refresh. Unlike ``/logout`` (which only clears the caller's cookie),
+        this affects every device. The user simply signs in again to get a
+        fresh token issued after the new epoch.
+        """
+        user = db.get(UserRow, user_id)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        user.tokens_valid_after = datetime.now(timezone.utc)
+        db.flush()
+        response = RedirectResponse(url="/login.html", status_code=302)
+        response.delete_cookie(COOKIE_NAME, path="/", domain=get_cookie_domain())
+        return response
+
     @router.get("/me")
     async def get_me(
         user_id: str = Depends(current_user_id), db: Session = Depends(get_db)

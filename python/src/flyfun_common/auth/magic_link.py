@@ -25,6 +25,7 @@ Helpers ``_find_or_create_user_by_email`` and
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import re
 import secrets
@@ -56,6 +57,10 @@ from flyfun_common.db.models import MagicLinkTokenRow, UserRow
 logger = logging.getLogger(__name__)
 
 TOKEN_TTL = timedelta(minutes=15)
+# Burn a token after this many wrong OTP guesses. With a 6-digit code and a
+# 15-min TTL this caps the success probability of brute force well below
+# 0.01% per token even with no working per-IP throttle.
+MAX_OTP_ATTEMPTS = 5
 APPLE_PRIVATE_RELAY_SUFFIX = "@privaterelay.appleid.com"
 
 # Permissive RFC-ish check -- catches obvious garbage without pulling in
@@ -110,9 +115,21 @@ def _is_safe_relative_path(value: str | None) -> bool:
 
 
 def _client_ip(request: Request) -> str | None:
+    """Best-effort trusted client IP for rate limiting.
+
+    The leftmost ``X-Forwarded-For`` entry is client-supplied and therefore
+    spoofable (our edge proxy appends, it does not replace). Prefer
+    ``X-Real-IP`` (Caddy sets it to the real peer via
+    ``header_up X-Real-IP {remote_host}``); otherwise take the *rightmost*
+    XFF token (the one our own proxy appended), matching the weather app's
+    ``security._client_ip``.
+    """
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip and real_ip.strip():
+        return real_ip.strip()
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",", 1)[0].strip() or None
+        return forwarded.split(",")[-1].strip() or None
     if request.client:
         return request.client.host
     return None
@@ -403,30 +420,49 @@ def build_magic_link_router(
             raise HTTPException(status_code=429, detail="Too many attempts")
 
         email_lower = _normalize_email(body.email)
-        code = body.code.strip()
-        code_hash = _sha256(code)
+        code_hash = _sha256(body.code.strip())
         now = _now()
 
-        # Scan recent unused tokens for this email; OTPs are short so we
-        # accept any matching row in the unexpired window.
-        row = (
+        # Fetch the live (unused, unexpired) tokens for this email WITHOUT the
+        # code filter, so a wrong guess still maps to the candidate token(s)
+        # and charges an attempt against them. OTPs are only 6 digits, so a
+        # per-token attempt cap is what actually bounds brute force.
+        candidates = (
             db.query(MagicLinkTokenRow)
             .filter(
                 MagicLinkTokenRow.email == email_lower,
                 MagicLinkTokenRow.used_at.is_(None),
                 MagicLinkTokenRow.expires_at >= now,
-                MagicLinkTokenRow.otp_code_hash == code_hash,
             )
             .order_by(MagicLinkTokenRow.created_at.desc())
-            .first()
+            .all()
         )
-        if row is None:
+        match = next(
+            (
+                r
+                for r in candidates
+                if r.otp_code_hash
+                and hmac.compare_digest(r.otp_code_hash, code_hash)
+            ),
+            None,
+        )
+        if match is None:
+            # Wrong code: charge an attempt against every live candidate and
+            # burn any that reaches the cap. Commit BEFORE raising — get_db
+            # rolls back on HTTPException, which would otherwise erase the
+            # counter (and the per-IP attempt row) and leave the OTP
+            # effectively unthrottled.
+            for r in candidates:
+                r.attempt_count = (r.attempt_count or 0) + 1
+                if r.attempt_count >= MAX_OTP_ATTEMPTS:
+                    r.used_at = now
+            db.commit()
             raise HTTPException(
                 status_code=400, detail="Invalid or expired code"
             )
 
         user = _find_or_create_user_by_email(
-            db, row.email, on_new_user=on_new_user, request=request
+            db, match.email, on_new_user=on_new_user, request=request
         )
 
         if not user.approved:
@@ -434,7 +470,7 @@ def build_magic_link_router(
                 status_code=403, detail="Account is pending approval"
             )
 
-        row.used_at = _now()
+        match.used_at = _now()
         db.flush()
 
         jwt_token = create_token(

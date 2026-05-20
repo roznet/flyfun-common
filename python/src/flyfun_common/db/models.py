@@ -35,6 +35,13 @@ class UserRow(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # Session-epoch revocation: any JWT whose `iat` predates this timestamp is
+    # rejected by `current_user_id`. Set on "log out everywhere" / suspected
+    # compromise to kill all of a user's outstanding (and self-renewing) tokens
+    # at once. NULL = never revoked (the common case; no UX impact).
+    tokens_valid_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
 
 class ApiTokenRow(Base):
@@ -88,6 +95,12 @@ class MagicLinkTokenRow(Base):
     )
     requested_ip: Mapped[str | None] = mapped_column(
         String(64), nullable=True, default=None, index=True
+    )
+    # Failed-OTP counter. The token is burned (used_at set) once this reaches
+    # MAX_OTP_ATTEMPTS, bounding brute force of the 6-digit code regardless of
+    # per-IP rate limiting.
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
 
 

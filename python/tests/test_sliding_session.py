@@ -369,3 +369,135 @@ def test_callback_no_next_redirects_home(callback_app):
     r2 = client.get("/auth/callback/google", follow_redirects=False)
     assert r2.status_code == 302
     assert r2.headers["location"] == "/"
+
+
+# ---------- Session-epoch revocation (tokens_valid_after) ----------
+
+@pytest.fixture
+def epoch_app(tmp_path, monkeypatch):
+    """Production-mode app with one approved user and a current_user_id-gated
+    endpoint, for exercising the session-epoch revocation check."""
+    from fastapi import Depends
+
+    from flyfun_common.db.deps import current_user_id
+    from flyfun_common.db.engine import (
+        get_engine, init_shared_db, reset_engine, SessionLocal,
+    )
+    from flyfun_common.db.models import UserRow
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("JWT_SECRET", "epoch-secret")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/epoch.db")
+    reset_engine()
+    get_engine()
+    init_shared_db()
+
+    s = SessionLocal()
+    try:
+        s.add(UserRow(
+            id="u1", provider="email", provider_sub="u@e.com",
+            email="u@e.com", display_name="U", approved=True,
+        ))
+        s.commit()
+    finally:
+        s.close()
+
+    app = FastAPI()
+
+    @app.get("/protected")
+    def protected(user_id: str = Depends(current_user_id)):
+        return {"user_id": user_id}
+
+    yield app
+    reset_engine()
+
+
+def _set_epoch(offset: timedelta) -> None:
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    s = SessionLocal()
+    try:
+        s.get(UserRow, "u1").tokens_valid_after = (
+            datetime.now(timezone.utc) + offset
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_session_epoch_revokes_pre_epoch_token(epoch_app):
+    client = TestClient(epoch_app)
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=20), sub="u1")
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/protected").status_code == 200
+
+    # "Log out everywhere": epoch moves ahead of the token's iat.
+    _set_epoch(timedelta(seconds=5))
+    assert client.get("/protected").status_code == 401
+
+
+def test_session_epoch_allows_post_epoch_token(epoch_app):
+    # Epoch set in the past; a token issued now is after it → still valid.
+    _set_epoch(timedelta(hours=-1))
+    client = TestClient(epoch_app)
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=20), sub="u1")
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/protected").status_code == 200
+
+
+def test_middleware_does_not_refresh_on_rejected_response():
+    """A near-expiry token on a 401 response must NOT be rolled forward —
+    otherwise revocation could be defeated by the refresh in its window."""
+    from fastapi import HTTPException
+
+    secret = "test-secret-reject"
+    app = _app_with_middleware(secret)
+
+    @app.get("/needs-auth")
+    def needs_auth():
+        raise HTTPException(status_code=401, detail="nope")
+
+    client = TestClient(app)
+    token = _forge_token(secret, exp_in=timedelta(days=5))  # in refresh window
+    client.cookies.set(COOKIE_NAME, token)
+    resp = client.get("/needs-auth")
+    assert resp.status_code == 401
+    assert _session_cookie_from(resp) is None
+
+
+def test_logout_all_bumps_epoch(tmp_path, monkeypatch):
+    from flyfun_common.auth.router import create_auth_router
+    from flyfun_common.db.engine import (
+        ensure_dev_user, get_engine, init_shared_db, reset_engine, SessionLocal,
+    )
+    from flyfun_common.db.models import UserRow
+    from starlette.middleware.sessions import SessionMiddleware
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    reset_engine()
+    get_engine()
+    init_shared_db()
+    s = SessionLocal()
+    try:
+        ensure_dev_user(s)
+    finally:
+        s.close()
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test")
+    app.include_router(create_auth_router())
+    client = TestClient(app)
+
+    resp = client.post("/auth/logout-all", follow_redirects=False)
+    assert resp.status_code == 302
+    assert "flyfun_auth" in resp.headers.get("set-cookie", "")
+
+    s = SessionLocal()
+    try:
+        assert s.get(UserRow, "dev-user-001").tokens_valid_after is not None
+    finally:
+        s.close()
+        reset_engine()

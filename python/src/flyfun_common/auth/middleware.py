@@ -88,7 +88,15 @@ class SlidingSessionMiddleware:
         transport, value = action
 
         async def send_wrapper(message):
-            if message["type"] == "http.response.start":
+            # Only roll the token forward on a successful response. A rejected
+            # request (401 revoked-session / expired, 403 suspended) must NOT
+            # receive a freshly-minted cookie/header — otherwise a revoked or
+            # near-expiry stolen token in its refresh window would be reissued
+            # with a new `iat`, defeating session-epoch revocation.
+            if (
+                message["type"] == "http.response.start"
+                and message.get("status", 200) < 400
+            ):
                 headers = list(message.get("headers", []))
                 if transport == "cookie":
                     if not _response_sets_session_cookie(headers):

@@ -70,13 +70,18 @@ def _authenticate_bearer_token(token: str, db: Session) -> str:
     return row.user_id
 
 
-def _decode_user_id(request: Request, db: Session) -> str:
-    """Extract user ID from JWT cookie or Bearer token.
+def _decode_user_id(request: Request, db: Session) -> tuple[str, int | None]:
+    """Extract (user_id, token_iat) from a JWT cookie or Bearer token.
+
+    ``token_iat`` is the JWT ``iat`` (epoch seconds) for cookie/Bearer-JWT
+    auth, used by the session-epoch revocation check. It is ``None`` for
+    dev-mode and ``ff_`` API-token auth, which the epoch check does not
+    apply to (API tokens are revoked individually via the api_tokens table).
 
     Priority: dev mode → cookie → Bearer (JWT or API token).
     """
     if is_dev_mode():
-        return DEV_USER_ID
+        return DEV_USER_ID, None
 
     secret = get_jwt_secret()
 
@@ -85,7 +90,7 @@ def _decode_user_id(request: Request, db: Session) -> str:
     if cookie:
         try:
             payload = decode_token(cookie, secret)
-            return payload["sub"]
+            return payload["sub"], payload.get("iat")
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Session expired")
         except (jwt.InvalidTokenError, KeyError):
@@ -98,14 +103,25 @@ def _decode_user_id(request: Request, db: Session) -> str:
         if not _is_api_token(bearer_token):
             try:
                 payload = decode_token(bearer_token, secret)
-                return payload["sub"]
+                return payload["sub"], payload.get("iat")
             except jwt.ExpiredSignatureError:
                 raise HTTPException(status_code=401, detail="Token expired")
             except (jwt.InvalidTokenError, KeyError):
                 raise HTTPException(status_code=401, detail="Invalid token")
-        return _authenticate_bearer_token(bearer_token, db)
+        return _authenticate_bearer_token(bearer_token, db), None
 
     raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+def _is_session_revoked(user: UserRow, token_iat: int | None) -> bool:
+    """True if a JWT issued at ``token_iat`` predates the user's revocation
+    epoch (set on "log out everywhere" / suspected compromise)."""
+    if token_iat is None or user.tokens_valid_after is None:
+        return False
+    valid_after = user.tokens_valid_after
+    if valid_after.tzinfo is None:
+        valid_after = valid_after.replace(tzinfo=timezone.utc)
+    return token_iat < valid_after.timestamp()
 
 
 def current_user_id(
@@ -113,7 +129,7 @@ def current_user_id(
     db: Session = Depends(get_db),
 ) -> str:
     """Return the authenticated user ID. Raises 401/403 on failure."""
-    user_id = _decode_user_id(request, db)
+    user_id, token_iat = _decode_user_id(request, db)
 
     if is_dev_mode():
         return user_id
@@ -123,6 +139,10 @@ def current_user_id(
         raise HTTPException(status_code=401, detail="User not found")
     if not user.approved:
         raise HTTPException(status_code=403, detail="Account suspended")
+    if _is_session_revoked(user, token_iat):
+        raise HTTPException(
+            status_code=401, detail="Session revoked, please sign in again"
+        )
 
     return user_id
 
@@ -133,7 +153,7 @@ def optional_user_id(
 ) -> str | None:
     """Return the authenticated user ID, or None if not authenticated."""
     try:
-        user_id = _decode_user_id(request, db)
+        user_id, token_iat = _decode_user_id(request, db)
     except HTTPException:
         return None
 
@@ -142,6 +162,8 @@ def optional_user_id(
 
     user = db.query(UserRow).filter(UserRow.id == user_id).first()
     if not user or not user.approved:
+        return None
+    if _is_session_revoked(user, token_iat):
         return None
 
     return user_id
