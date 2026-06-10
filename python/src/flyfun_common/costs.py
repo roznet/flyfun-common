@@ -1,4 +1,4 @@
-"""Cost ledger utilities: record, query, and check budget."""
+"""Cost ledger utilities: record and query."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from flyfun_common.db.models import CostLedgerRow, UserRow
+from flyfun_common.db.models import CostLedgerRow
 
 
 def record_cost(
@@ -62,14 +62,6 @@ def get_cost_since(
     if service:
         q = q.filter(CostLedgerRow.service == service)
     return float(q.scalar())
-
-
-def check_budget(db: Session, user_id: str) -> tuple[float, float]:
-    """Return (total_spent, spending_limit) for a user."""
-    total = get_total_cost(db, user_id)
-    user = db.get(UserRow, user_id)
-    limit = user.spending_limit if user else 500.0
-    return total, limit
 
 
 def get_cost_breakdown(

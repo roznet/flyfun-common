@@ -26,9 +26,6 @@ class UserRow(Base):
     email: Mapped[str] = mapped_column(String(256), default="")
     display_name: Mapped[str] = mapped_column(String(256), default="")
     approved: Mapped[bool] = mapped_column(Boolean, default=True)
-    spending_limit: Mapped[float] = mapped_column(
-        Float, default=500.0, server_default="500.0"
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -133,3 +130,44 @@ class CostLedgerRow(Base):
     description: Mapped[str | None] = mapped_column(String(256), nullable=True)
     detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class DonationRow(Base):
+    """Voluntary donations (money *in*), kept separate from the cost ledger.
+
+    Distinct from CostLedgerRow on purpose: donations carry a charged currency,
+    a Stripe reference, and a refundable status — a different shape from the cost
+    ledger's "always positive USD = cost" invariant. USD is the canonical
+    accounting currency: ``amount``/``currency`` are what Stripe charged, and
+    ``amount_usd`` is converted once at webhook time so historical totals don't
+    drift with FX.
+
+    The actual ``donation_ledger`` table is created by each consuming app's
+    Alembic migration (flyfun-common ships no migrations of its own), the same
+    way ``cost_ledger`` is.
+    """
+
+    __tablename__ = "donation_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Nullable, no FK: anonymous/logged-out donors are allowed, and an
+    # attributed donation must survive deletion of the donor's user row.
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    service: Mapped[str] = mapped_column(String(64))
+    amount: Mapped[float] = mapped_column(Float)  # charged amount in `currency`, positive
+    currency: Mapped[str] = mapped_column(String(3))  # ISO 4217 as charged
+    amount_usd: Mapped[float] = mapped_column(Float)  # converted to USD at donation time
+    fx_rate: Mapped[float] = mapped_column(Float)  # rate used, recorded for auditability
+    # USD net of the Stripe fee, when known from the balance transaction.
+    net_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recurring: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), default="succeeded")
+    provider: Mapped[str] = mapped_column(String(32), default="stripe")
+    # Stripe PaymentIntent / Checkout Session id. Unique for webhook idempotency;
+    # capped at 191 chars for MySQL utf8mb4 unique-index limits.
+    provider_ref: Mapped[str] = mapped_column(String(191), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,  # yearly community rollups filter/sort on this
+    )
