@@ -10,7 +10,6 @@ from sqlalchemy.pool import StaticPool
 
 from flyfun_common.db.models import Base, UserRow
 from flyfun_common.costs import (
-    check_budget,
     get_cost_breakdown,
     get_cost_since,
     get_total_cost,
@@ -30,7 +29,7 @@ def db():
 
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
-    session.add(UserRow(id="u1", approved=True, spending_limit=100.0))
+    session.add(UserRow(id="u1", approved=True))
     session.flush()
     yield session
     session.close()
@@ -52,13 +51,6 @@ def test_cost_since(db):
     record_cost(db, "u1", "weather", "briefing", 2.0)
     since = datetime.now(timezone.utc) - timedelta(hours=1)
     assert get_cost_since(db, "u1", since) == pytest.approx(2.0)
-
-
-def test_check_budget(db):
-    record_cost(db, "u1", "weather", "briefing", 50.0)
-    spent, limit = check_budget(db, "u1")
-    assert spent == pytest.approx(50.0)
-    assert limit == pytest.approx(100.0)
 
 
 def test_cost_breakdown(db):
