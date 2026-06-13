@@ -7,8 +7,19 @@ Thin and app-agnostic. The only Stripe surfaces donations need:
 - pull a charge's **fee ratio** so the caller can record a USD-net figure.
 
 Secrets come from the environment (``STRIPE_SECRET_KEY`` /
-``STRIPE_WEBHOOK_SECRET``). The Stripe API version is pinned here so webhook
-event payload shapes stay stable regardless of the account's dashboard default.
+``STRIPE_WEBHOOK_SECRET``). ``STRIPE_API_VERSION`` is pinned here so the
+responses to our **outbound** calls (``Session.create``,
+``PaymentIntent.retrieve``) deserialize against a known shape — notably the
+balance-transaction fields :func:`retrieve_net_ratio` reads.
+
+It does **not** govern the shape of incoming **webhook event payloads**:
+``construct_event`` only verifies the signature and parses the JSON as-is, and
+Stripe serializes the event using the *webhook endpoint's* configured API
+version (or the account default), not the SDK's. To keep
+:func:`extract_donation_from_session` parsing stable in production, the webhook
+endpoint itself must be created with a pinned ``api_version`` (Stripe Dashboard,
+or the ``api_version`` arg when registering the endpoint via API). That is part
+of the Stripe-account setup tracked in flyfun-weather#186.
 
 The donation flow is **recurring-capable but one-time-first**: the session
 factory accepts ``recurring=True`` (``mode=subscription``) so callers never need
@@ -24,9 +35,10 @@ from dataclasses import dataclass
 
 import stripe
 
-# Pin to the API version this SDK major (15.x) ships with. Locking it means a
-# change to the account's dashboard default can't silently reshape the webhook
-# event payloads we parse.
+# Pin to the API version this SDK major (15.x) ships with, so the responses to
+# our outbound calls (Session.create, PaymentIntent.retrieve) keep a known
+# shape. This does NOT affect incoming webhook payload shapes — pin those on the
+# webhook endpoint itself (see module docstring).
 STRIPE_API_VERSION = "2026-05-27.dahlia"
 
 # Currencies Stripe treats as having no minor unit — `unit_amount` is the whole
