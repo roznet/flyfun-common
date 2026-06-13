@@ -10,7 +10,7 @@ Provide the shared database layer that all flyfun apps connect to. Contains only
 
 ```
 db/
-├── models.py    # UserRow, ApiTokenRow, MagicLinkTokenRow, …, Base
+├── models.py    # UserRow, ApiTokenRow, MagicLinkTokenRow, CostLedgerRow, DonationRow, …, Base
 ├── engine.py    # Singleton engine, init_shared_db, ensure_dev_user
 └── deps.py      # get_db(), current_user_id() FastAPI dependencies
 ```
@@ -27,7 +27,6 @@ db/
 | `email` | String(256) | From OAuth profile |
 | `display_name` | String(256) | |
 | `approved` | Boolean | Default True; admin can revoke |
-| `spending_limit` | Float | Default 500.0 (dormant — for future donation model) |
 | `created_at` | DateTime(tz) | |
 | `last_login_at` | DateTime(tz) | Nullable |
 
@@ -59,7 +58,27 @@ db/
 | `detail_json` | Text | Nullable — rich structured data (e.g. CostBreakdown) |
 | `reference_id` | String(128) | Nullable — app-level FK as string |
 
-Helper utilities in `flyfun_common.costs`: `record_cost()`, `get_total_cost()`, `get_cost_since()`, `check_budget()`, `get_cost_breakdown()`.
+Helper utilities in `flyfun_common.costs`: `record_cost()`, `get_total_cost()`, `get_cost_since()`, `get_cost_breakdown()`.
+
+**`donation_ledger`** — cross-app voluntary donations (money *in*), kept separate from `cost_ledger` because the shapes differ: donations carry a charged currency, a Stripe reference, and a refundable status, whereas the cost ledger's invariant is "always positive USD = cost". USD is canonical — `amount`/`currency` are what Stripe charged, `amount_usd` is converted once at webhook time so historical totals don't drift with FX.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | Integer PK | Auto-increment |
+| `user_id` | String(64) | Nullable, indexed, no FK (anonymous donors; survives user deletion) |
+| `service` | String(64) | App the donation came through (`"flyfun-weather"`) |
+| `amount` | Float | Charged amount in `currency`, positive |
+| `currency` | String(3) | ISO 4217 as charged (`"EUR"`, `"GBP"`, `"USD"`) |
+| `amount_usd` | Float | Converted to USD at donation time (for aggregation) |
+| `fx_rate` | Float | Rate used (units per USD), recorded for auditability |
+| `net_usd` | Float | Nullable — `amount_usd` net of the Stripe fee, when known |
+| `recurring` | Boolean | One-time vs subscription |
+| `status` | String(32) | `"succeeded"`, `"refunded"` |
+| `provider` | String(32) | `"stripe"` |
+| `provider_ref` | String(191) | Stripe PaymentIntent / Session id — **unique** for webhook idempotency |
+| `created_at` | DateTime(tz) | Indexed for yearly rollups |
+
+Helper utilities in `flyfun_common.payments` (`donations`, `stripe_client`) and `flyfun_common.fx` — see the **payments** and **fx** module docs. App-facing endpoints, impact framing, and UI live in each consuming app (e.g. flyfun-weather), not here.
 
 **`magic_link_tokens`** — short-lived sign-in tokens for the magic-link auth path. Consumer apps add the migration; flyfun-common ships only the model.
 
@@ -209,8 +228,8 @@ def cleanup_orphaned_data():
 
 ## Key Choices
 
-- **No FK constraint on `api_tokens.user_id` or `cost_ledger.user_id`**: Both are plain `String(64)` with an index, no `ForeignKey`. For `api_tokens` this avoids table creation order issues between shared and app-specific `Base` classes. For `cost_ledger` this ensures rows survive user deletion (audit/reporting data).
-- **`spending_limit` on UserRow**: Dormant — used by weather for auto-reload tracking. Will become relevant if voluntary donations are added. Apps that don't need it simply ignore it.
+- **No FK constraint on `api_tokens.user_id`, `cost_ledger.user_id`, or `donation_ledger.user_id`**: All plain `String(64)` with an index, no `ForeignKey`. For `api_tokens` this avoids table creation order issues between shared and app-specific `Base` classes. For `cost_ledger`/`donation_ledger` it ensures rows survive user deletion (audit/reporting data); `donation_ledger.user_id` is additionally nullable for anonymous donors.
+- **Donations are a separate ledger, not `spending_limit`**: an earlier `spending_limit` column on `UserRow` (a dormant per-user spend balance) was **retired** — nothing read it to gate anything, and donations are a different shape entirely. Voluntary donations now live in `donation_ledger` (money in, with currency/refund/Stripe-ref). The column DROP migration is each consuming app's responsibility (flyfun-common ships no migrations).
 - **`cost_ledger` extended columns** (`category`, `description`, `detail_json`, `reference_id`): All nullable so simple apps (maps, forms) can call `record_cost()` with just the positional args, while weather stores rich CostBreakdown data in `detail_json`.
 - **Single `flyfun.db` in dev**: All apps share one SQLite file locally. Simulates the shared MySQL in production.
 - **`get_db()` auto-commits**: The generator commits on success, rolls back on exception. Endpoints don't need explicit `db.commit()`.
