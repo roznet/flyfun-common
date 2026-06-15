@@ -30,6 +30,7 @@ handled yet — that is a tracked follow-up.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -75,6 +76,20 @@ class CheckoutDonation:
     currency: str  # ISO 4217, uppercase
     recurring: bool
     payment_intent_id: str | None  # for the fee-ratio lookup; None for subscriptions
+
+
+def _as_plain_dict(obj: object) -> dict:
+    """Coerce a Stripe ``StripeObject`` (or dict) to a plain nested dict.
+
+    In stripe-python 15.x a ``StripeObject`` is **not** a dict and does not
+    support ``.get()`` — only ``obj["k"]`` / ``obj.k`` — so callers that expect
+    dict semantics break against real API/webhook objects (while passing tests
+    that feed plain dicts). ``str(StripeObject)`` is JSON, so round-tripping
+    yields a fully-nested plain dict; a dict passes through untouched.
+    """
+    if isinstance(obj, dict):
+        return obj
+    return json.loads(str(obj))
 
 
 def _secret_key() -> str:
@@ -148,8 +163,12 @@ def create_checkout_session(
     return stripe.checkout.Session.create(**params)
 
 
-def verify_webhook_event(payload: bytes, sig_header: str) -> stripe.Event:
-    """Verify a webhook payload's signature and return the parsed event.
+def verify_webhook_event(payload: bytes, sig_header: str) -> dict:
+    """Verify a webhook payload's signature and return the event as a dict.
+
+    Returns a plain nested ``dict`` (not a ``StripeObject``) so callers can use
+    ordinary ``event["type"]`` / ``.get()`` semantics — a real ``StripeObject``
+    in stripe 15.x supports neither ``.get()`` reliably nor ``isinstance(_, dict)``.
 
     Raises :class:`StripeNotConfigured` if ``STRIPE_WEBHOOK_SECRET`` is unset,
     :class:`stripe.SignatureVerificationError` on a bad/forged/expired
@@ -159,7 +178,7 @@ def verify_webhook_event(payload: bytes, sig_header: str) -> stripe.Event:
     secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
     if not secret:
         raise StripeNotConfigured("STRIPE_WEBHOOK_SECRET is not set")
-    return stripe.Webhook.construct_event(payload, sig_header, secret)
+    return _as_plain_dict(stripe.Webhook.construct_event(payload, sig_header, secret))
 
 
 def extract_donation_from_session(session: dict) -> CheckoutDonation:
@@ -167,9 +186,10 @@ def extract_donation_from_session(session: dict) -> CheckoutDonation:
 
     ``provider_ref`` is the PaymentIntent id — stable across the charge and a
     later ``charge.refunded`` — falling back to the session id when no
-    PaymentIntent is present (subscription mode). Accepts either a Stripe object
-    or a plain dict (both support ``[]``/``.get``).
+    PaymentIntent is present (subscription mode). Accepts either a raw Stripe
+    ``StripeObject`` or a plain dict — both are coerced to a plain dict first.
     """
+    session = _as_plain_dict(session)
     payment_intent_id = session.get("payment_intent")
     provider_ref = payment_intent_id or session.get("id")
     metadata = session.get("metadata") or {}
@@ -198,8 +218,10 @@ def retrieve_net_ratio(payment_intent_id: str) -> float | None:
     ``amount_usd`` by it to get ``net_usd``, keeping USD canonical.
     """
     _configure()
-    pi = stripe.PaymentIntent.retrieve(
-        payment_intent_id, expand=["latest_charge.balance_transaction"]
+    pi = _as_plain_dict(
+        stripe.PaymentIntent.retrieve(
+            payment_intent_id, expand=["latest_charge.balance_transaction"]
+        )
     )
     charge = pi.get("latest_charge")
     if not charge:

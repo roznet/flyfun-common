@@ -187,3 +187,50 @@ def test_net_ratio_none_when_no_charge(monkeypatch):
 def test_net_ratio_none_when_no_balance_transaction(monkeypatch):
     _mock_pi(monkeypatch, {"latest_charge": {"balance_transaction": None}})
     assert sc.retrieve_net_ratio("pi_1") is None
+
+
+# --- real StripeObject handling -------------------------------------------
+# Regression: in stripe 15.x a StripeObject is NOT a dict and has no `.get()`.
+# The earlier mocks all fed plain dicts, so the `.get()`-based code passed tests
+# but broke against real API/webhook objects. These tests use genuine
+# StripeObjects to lock in dict-coercion.
+
+
+def test_verify_returns_plain_dict_from_real_event(monkeypatch):
+    monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", "whsec_x")
+    real_event = stripe.Event.construct_from(
+        {"type": "checkout.session.completed",
+         "data": {"object": {"id": "cs_1", "currency": "eur"}}},
+        "sk_test",
+    )
+    assert not isinstance(real_event, dict) and not hasattr(real_event, "get")
+    monkeypatch.setattr(stripe.Webhook, "construct_event",
+                        staticmethod(lambda *a, **k: real_event))
+    event = sc.verify_webhook_event(b"{}", "sig")
+    # Must be a plain dict with working .get() / nested access.
+    assert isinstance(event, dict)
+    assert event.get("type") == "checkout.session.completed"
+    assert event["data"]["object"].get("currency") == "eur"
+
+
+def test_extract_from_real_stripe_object():
+    session = stripe.checkout.Session.construct_from(
+        {"id": "cs_1", "payment_intent": "pi_1", "client_reference_id": "u1",
+         "metadata": {"service": "flyfun-weather", "user_id": "u1"},
+         "currency": "eur", "amount_total": 1000, "mode": "payment"},
+        "sk_test",
+    )
+    d = sc.extract_donation_from_session(session)  # would AttributeError without coercion
+    assert d.provider_ref == "pi_1"
+    assert d.amount == pytest.approx(10.0)
+    assert d.currency == "EUR"
+    assert d.service == "flyfun-weather"
+
+
+def test_net_ratio_from_real_stripe_object(monkeypatch):
+    pi = stripe.PaymentIntent.construct_from(
+        {"id": "pi_1", "latest_charge": {"balance_transaction": {"amount": 1000, "net": 967}}},
+        "sk_test",
+    )
+    _mock_pi(monkeypatch, pi)
+    assert sc.retrieve_net_ratio("pi_1") == pytest.approx(0.967)
