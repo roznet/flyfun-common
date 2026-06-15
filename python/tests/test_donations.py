@@ -9,10 +9,12 @@ from sqlalchemy.pool import StaticPool
 
 from flyfun_common.db.models import Base, DonationRow
 from flyfun_common.payments.donations import (
+    get_donation,
     get_user_total_usd,
     get_year_total_usd,
     mark_refunded,
     record_donation,
+    set_net_usd,
 )
 
 
@@ -87,6 +89,28 @@ def test_refund_flips_status_and_drops_from_total(db):
 
 def test_refund_unknown_ref_returns_none(db):
     assert mark_refunded(db, "pi_does_not_exist") is None
+
+
+def test_get_donation(db):
+    _donate(db, "pi_1")
+    assert get_donation(db, "pi_1").provider_ref == "pi_1"
+    assert get_donation(db, "nope") is None
+
+
+def test_set_net_usd_backfills_once(db):
+    row, _ = _donate(db, "pi_1")
+    assert row.net_usd is None  # starts empty (balance txn not ready at record time)
+    updated = set_net_usd(db, "pi_1", 23.4)
+    assert updated is not None
+    assert updated.net_usd == pytest.approx(23.4)
+    # Idempotent: a later charge.updated must NOT clobber the existing value.
+    again = set_net_usd(db, "pi_1", 99.9)
+    assert again is None
+    assert get_donation(db, "pi_1").net_usd == pytest.approx(23.4)
+
+
+def test_set_net_usd_unknown_ref_returns_none(db):
+    assert set_net_usd(db, "pi_missing", 1.0) is None
 
 
 def test_user_total_service_filter(db):
