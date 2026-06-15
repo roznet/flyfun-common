@@ -11,10 +11,12 @@ created by each app's own Alembic migration (this library ships no migrations).
 """
 
 from flyfun_common.payments.donations import (  # noqa: F401
+    get_donation,
     get_user_total_usd,
     get_year_total_usd,
     mark_refunded,
     record_donation,
+    set_net_usd,
 )
 from flyfun_common.payments.stripe_client import (  # noqa: F401
     CheckoutDonation,
@@ -30,10 +32,12 @@ __all__ = [
     "StripeNotConfigured",
     "create_checkout_session",
     "extract_donation_from_session",
+    "get_donation",
     "get_user_total_usd",
     "get_year_total_usd",
     "mark_refunded",
     "record_donation",
     "retrieve_net_ratio",
+    "set_net_usd",
     "verify_webhook_event",
 ]

@@ -101,6 +101,31 @@ def mark_refunded(db: Session, provider_ref: str) -> DonationRow | None:
     return row
 
 
+def get_donation(db: Session, provider_ref: str) -> DonationRow | None:
+    """Return the donation with this ``provider_ref``, or ``None``."""
+    return _get_by_ref(db, provider_ref)
+
+
+def set_net_usd(
+    db: Session, provider_ref: str, net_usd: float
+) -> DonationRow | None:
+    """Set ``net_usd`` (USD net of the Stripe fee) on a donation, **once**.
+
+    Idempotent and order-tolerant: the Stripe fee lives on the charge's balance
+    transaction, which Stripe creates slightly *after* the charge — so it is
+    usually unavailable when ``checkout.session.completed`` fires and
+    ``net_usd`` starts NULL. A later ``charge.updated`` backfills it via this
+    helper. Returns ``None`` (a no-op) if the donation is unknown or already has
+    a ``net_usd``, so repeated ``charge.updated`` deliveries don't clobber it.
+    """
+    row = _get_by_ref(db, provider_ref)
+    if row is None or row.net_usd is not None:
+        return None
+    row.net_usd = net_usd
+    db.flush()
+    return row
+
+
 def get_user_total_usd(
     db: Session, user_id: str, service: str | None = None
 ) -> float:
