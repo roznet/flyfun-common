@@ -129,6 +129,7 @@ def create_checkout_session(
     service: str,
     user_id: str | None = None,
     customer_email: str | None = None,
+    product_name: str = "Donation to flyfun",
 ) -> stripe.checkout.Session:
     """Create a hosted Stripe Checkout Session for a donation.
 
@@ -136,13 +137,15 @@ def create_checkout_session(
     one-time (``mode=payment``); ``recurring=True`` → a monthly subscription
     (``mode=subscription``). ``user_id`` (when logged in) and ``service`` ride
     along in metadata / ``client_reference_id`` so the webhook can attribute the
-    donation; anonymous donations are allowed (``user_id=None``).
+    donation; anonymous donations are allowed (``user_id=None``). ``product_name``
+    is the line-item label shown on the hosted Checkout page — pass the app's own
+    (e.g. "Donation to FlyFun Weather"); the default stays app-agnostic.
     """
     _configure()
     price_data: dict = {
         "currency": currency.lower(),
         "unit_amount": to_minor_units(amount, currency),
-        "product_data": {"name": "Donation to flyfun"},
+        "product_data": {"name": product_name},
     }
     mode = "payment"
     if recurring:

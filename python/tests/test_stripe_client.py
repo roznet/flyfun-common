@@ -58,6 +58,24 @@ def test_create_one_time_session(captured_create):
     assert captured_create["metadata"] == {"service": "flyfun-weather", "user_id": "u1"}
 
 
+def test_create_session_product_name(captured_create):
+    sc.create_checkout_session(
+        amount=10.0, currency="EUR", recurring=False,
+        success_url="https://x/ok", cancel_url="https://x/no",
+        service="flyfun-weather", product_name="Donation to FlyFun Weather",
+    )
+    assert captured_create["line_items"][0]["price_data"]["product_data"]["name"] == "Donation to FlyFun Weather"
+
+
+def test_create_session_default_product_name(captured_create):
+    sc.create_checkout_session(
+        amount=10.0, currency="EUR", recurring=False,
+        success_url="https://x/ok", cancel_url="https://x/no",
+        service="flyfun-weather",
+    )
+    assert captured_create["line_items"][0]["price_data"]["product_data"]["name"] == "Donation to flyfun"
+
+
 def test_create_recurring_session(captured_create):
     sc.create_checkout_session(
         amount=5.0,
