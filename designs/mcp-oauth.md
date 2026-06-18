@@ -50,9 +50,11 @@ Claude.ai GETs `mcp.flyfun.aero/.well-known/oauth-authorization-server`:
   "grant_types_supported": ["authorization_code", "refresh_token"],
   "token_endpoint_auth_methods_supported": ["client_secret_post"],
   "code_challenge_methods_supported": ["S256"],
-  "scopes_supported": ["mcp"]
+  "scopes_supported": ["mcp", "flights:read"]
 }
 ```
+
+> `scopes_supported` is per-app: weatherbrief advertises `["mcp", "flights:read"]` (the latter for third-party/native flight read access, #274). An app passes its list to `create_oauth_router(scopes_supported=…)`; the discovery JSON is served by Caddy and must be kept in sync.
 
 Caddy serves this — add to `mcp.flyfun.aero.caddy`:
 ```
@@ -85,6 +87,8 @@ Response:
   "grant_types": ["authorization_code", "refresh_token"]
 }
 ```
+
+`redirect_uris` are validated by `_validate_redirect_uri`: **HTTPS**, **http loopback** (`localhost`/`127.0.0.1`, for dev), or an **RFC 8252 §7.1 private-use URI scheme** — a reverse-domain scheme like `net.ro-z.flyfun-example://oauth-callback` used by native iOS/Android apps (#274).
 
 **New table: `oauth_clients`**
 
@@ -153,6 +157,7 @@ The endpoint:
    - `user_id` from the auth code
    - `name` = client_name (e.g. "Claude.ai - Acme Corp")
    - `oauth_client_id` = the client that requested it (for revocation tracking)
+   - `scope` = the auth code's granted scope (NULL when empty → unrestricted)
 5. Optionally generates a refresh token (longer-lived, stored separately)
 6. Returns:
 ```json
@@ -160,7 +165,8 @@ The endpoint:
   "access_token": "ff_...",
   "token_type": "bearer",
   "expires_in": 604800,
-  "refresh_token": "ffr_..."
+  "refresh_token": "ffr_...",
+  "scope": "mcp"
 }
 ```
 
@@ -191,6 +197,18 @@ Issues a new access token, rotates the refresh token, revokes the old access tok
 | revoked | Boolean | Default false, set true on rotation |
 
 **New column on `api_tokens`:** `oauth_client_id` — String(64), nullable. Tracks which OAuth client issued the token (for revocation/audit). Null for manually-created tokens.
+
+**New column on `api_tokens`:** `scope` — String(256), nullable. The space-delimited OAuth scope granted to the token. NULL/empty = unrestricted (cookie sessions, manually-created tokens, legacy pre-scope OAuth tokens). See *Scope enforcement* below.
+
+### Scope enforcement (least-privilege)
+
+`db.deps` enforces scope per-endpoint via a registry (`register_scope_paths(scope, [(method, path_regex), …])`) that each app populates at startup. Enforcement runs inside `current_user_id` / `optional_user_id`, so any endpoint guarded by them is covered:
+
+- **No scope (NULL/empty)** → unrestricted. Keeps cookie/JWT sessions, manually-created tokens, and legacy OAuth tokens working unchanged.
+- **A scope not in the registry (e.g. `mcp`)** → treated as broad/full access. This is what keeps the claude.ai/Cowork MCP connector working — `mcp` is intentionally *not* registered as a limited scope.
+- **A token whose scopes are *all* registered (limited)** → may reach only the registered `(method, path)` endpoints for those scopes; anything else is **403 `insufficient_scope`** (with a `WWW-Authenticate: Bearer error="insufficient_scope"` header).
+
+Example (weatherbrief, #274): `register_scope_paths("flights:read", [("GET", r"/api/flights"), ("GET", r"/api/flights/[^/]+/export")])` — a `flights:read` token reads the flight list + per-flight export and is 403 everywhere else.
 
 ### 6. MCP Requests
 

@@ -337,7 +337,7 @@ def _approve_and_get_code(test_client, client_id, challenge, redirect_uri="https
     return params["code"][0]
 
 
-def test_token_exchange_success(client):
+def test_token_exchange_success(client, db_session):
     client_id, client_secret = _register_client(client)
     verifier, challenge = _make_challenge()
     code = _approve_and_get_code(client, client_id, challenge)
@@ -356,6 +356,15 @@ def test_token_exchange_success(client):
     assert data["token_type"] == "bearer"
     assert data["expires_in"] == 7 * 86400
     assert data["refresh_token"].startswith("ffr_")
+    # Scope is echoed in the token response and persisted on the issued token.
+    assert data["scope"] == "mcp"
+    issued = (
+        db_session.query(ApiTokenRow)
+        .filter(ApiTokenRow.token_hash == hash_token(data["access_token"]))
+        .first()
+    )
+    assert issued is not None
+    assert issued.scope == "mcp"
 
 
 def test_token_exchange_bad_pkce(client):

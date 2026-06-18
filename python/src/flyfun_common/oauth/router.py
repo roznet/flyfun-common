@@ -509,6 +509,7 @@ def _handle_authorization_code(
             name=client.client_name or client.id,
             expires_at=expires_at,
             oauth_client_id=client.id,
+            scope=auth_code.scope or None,
         )
     )
 
@@ -535,6 +536,7 @@ def _handle_authorization_code(
         "token_type": "bearer",
         "expires_in": token_expiry_days * 86400,
         "refresh_token": refresh_plain,
+        "scope": auth_code.scope or "",
     })
 
 
@@ -601,6 +603,7 @@ def _handle_refresh_token(
             name=client.client_name or client.id,
             expires_at=expires_at,
             oauth_client_id=client.id,
+            scope=rt.scope or None,
         )
     )
 
@@ -623,4 +626,5 @@ def _handle_refresh_token(
         "token_type": "bearer",
         "expires_in": token_expiry_days * 86400,
         "refresh_token": new_refresh,
+        "scope": rt.scope or "",
     })

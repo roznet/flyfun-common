@@ -61,6 +61,13 @@ class ApiTokenRow(Base):
     oauth_client_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, default=None
     )
+    # OAuth scope granted to this token (space-delimited). NULL/empty means
+    # unrestricted — legacy tokens, manually-created tokens, and cookie sessions
+    # carry no scope and keep full access. A non-empty scope is enforced per the
+    # scope→endpoint registry in db.deps (see register_scope_paths).
+    scope: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, default=None
+    )
 
 
 class UserPreferencesRow(Base):

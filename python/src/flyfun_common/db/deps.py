@@ -9,6 +9,7 @@ Supports three auth methods (in priority order):
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Generator
 from datetime import datetime, timezone
 
@@ -23,6 +24,64 @@ from flyfun_common.db.models import ApiTokenRow, UserRow
 
 TOKEN_PREFIX = "ff_"
 _LEGACY_TOKEN_PREFIX = "wb_"  # accept old tokens during migration
+
+# ---------------------------------------------------------------------------
+# OAuth scope enforcement (least-privilege for scoped access tokens)
+#
+# A token's ``scope`` is space-delimited. NULL/empty scope means UNRESTRICTED —
+# cookie sessions, JWTs, manually-created API tokens, and legacy/pre-scope OAuth
+# tokens all carry no scope and keep full access.
+#
+# Only scopes registered here via ``register_scope_paths`` are "limited": a token
+# whose granted scopes are *all* limited may reach ONLY the (method, path)
+# endpoints registered for those scopes — everything else is 403
+# insufficient_scope (default-deny). A token that also carries an unregistered
+# scope (e.g. the broad ``mcp`` connector scope) is treated as full access, so
+# adding ``flights:read`` does not retroactively cage existing connectors.
+# ---------------------------------------------------------------------------
+_SCOPE_ALLOWLIST: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+
+
+def register_scope_paths(scope: str, rules: list[tuple[str, str]]) -> None:
+    """Register the endpoints a limited ``scope`` is allowed to reach.
+
+    ``rules`` is a list of ``(method, path_regex)`` pairs; ``method`` may be
+    ``"*"`` to match any verb. The regex is matched against ``request.url.path``
+    with ``re.fullmatch`` semantics (anchor explicitly if you use ``.*``).
+    Idempotent — re-registering a scope replaces its rules.
+    """
+    _SCOPE_ALLOWLIST[scope] = [(m.upper(), re.compile(p)) for m, p in rules]
+
+
+def _enforce_scope(request: Request, scope: str | None) -> None:
+    """Raise 403 if a limited-scope token may not reach this (method, path).
+
+    No-op for unrestricted tokens (no scope) and for tokens carrying any
+    scope that isn't in the limited registry (e.g. ``mcp`` → full access).
+    """
+    if not scope:
+        return
+    granted = scope.split()
+    limited = [s for s in granted if s in _SCOPE_ALLOWLIST]
+    if len(limited) != len(granted):
+        # Carries at least one unregistered (broad) scope → full access.
+        return
+    method = request.method.upper()
+    path = request.url.path
+    for s in limited:
+        for allowed_method, pattern in _SCOPE_ALLOWLIST[s]:
+            if allowed_method in (method, "*") and pattern.fullmatch(path):
+                return
+    raise HTTPException(
+        status_code=403,
+        detail="insufficient_scope",
+        headers={
+            "WWW-Authenticate": (
+                'Bearer error="insufficient_scope", '
+                f'scope="{" ".join(limited)}"'
+            )
+        },
+    )
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -43,8 +102,12 @@ def _is_api_token(token: str) -> bool:
     return token.startswith(TOKEN_PREFIX) or token.startswith(_LEGACY_TOKEN_PREFIX)
 
 
-def _authenticate_bearer_token(token: str, db: Session) -> str:
-    """Validate a hashed API token against the api_tokens table."""
+def _authenticate_bearer_token(token: str, db: Session) -> tuple[str, str | None]:
+    """Validate a hashed API token; return ``(user_id, scope)``.
+
+    ``scope`` is the space-delimited OAuth scope stored on the token, or
+    ``None`` for unscoped (manually-created / legacy / pre-scope) tokens.
+    """
     if not _is_api_token(token):
         raise HTTPException(status_code=401, detail="Invalid token format")
 
@@ -67,21 +130,26 @@ def _authenticate_bearer_token(token: str, db: Session) -> str:
 
     row.last_used_at = datetime.now(timezone.utc)
     db.flush()
-    return row.user_id
+    return row.user_id, row.scope
 
 
-def _decode_user_id(request: Request, db: Session) -> tuple[str, int | None]:
-    """Extract (user_id, token_iat) from a JWT cookie or Bearer token.
+def _decode_user_id(
+    request: Request, db: Session
+) -> tuple[str, int | None, str | None]:
+    """Extract (user_id, token_iat, scope) from a JWT cookie or Bearer token.
 
     ``token_iat`` is the JWT ``iat`` (epoch seconds) for cookie/Bearer-JWT
     auth, used by the session-epoch revocation check. It is ``None`` for
     dev-mode and ``ff_`` API-token auth, which the epoch check does not
     apply to (API tokens are revoked individually via the api_tokens table).
 
+    ``scope`` is the OAuth scope of an ``ff_`` API token, or ``None`` for
+    every full-access path (dev mode, cookie, Bearer-JWT, unscoped tokens).
+
     Priority: dev mode → cookie → Bearer (JWT or API token).
     """
     if is_dev_mode():
-        return DEV_USER_ID, None
+        return DEV_USER_ID, None, None
 
     secret = get_jwt_secret()
 
@@ -90,7 +158,7 @@ def _decode_user_id(request: Request, db: Session) -> tuple[str, int | None]:
     if cookie:
         try:
             payload = decode_token(cookie, secret)
-            return payload["sub"], payload.get("iat")
+            return payload["sub"], payload.get("iat"), None
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Session expired")
         except (jwt.InvalidTokenError, KeyError):
@@ -103,12 +171,13 @@ def _decode_user_id(request: Request, db: Session) -> tuple[str, int | None]:
         if not _is_api_token(bearer_token):
             try:
                 payload = decode_token(bearer_token, secret)
-                return payload["sub"], payload.get("iat")
+                return payload["sub"], payload.get("iat"), None
             except jwt.ExpiredSignatureError:
                 raise HTTPException(status_code=401, detail="Token expired")
             except (jwt.InvalidTokenError, KeyError):
                 raise HTTPException(status_code=401, detail="Invalid token")
-        return _authenticate_bearer_token(bearer_token, db), None
+        user_id, scope = _authenticate_bearer_token(bearer_token, db)
+        return user_id, None, scope
 
     raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -129,7 +198,8 @@ def current_user_id(
     db: Session = Depends(get_db),
 ) -> str:
     """Return the authenticated user ID. Raises 401/403 on failure."""
-    user_id, token_iat = _decode_user_id(request, db)
+    user_id, token_iat, scope = _decode_user_id(request, db)
+    _enforce_scope(request, scope)
 
     if is_dev_mode():
         return user_id
@@ -151,11 +221,18 @@ def optional_user_id(
     request: Request,
     db: Session = Depends(get_db),
 ) -> str | None:
-    """Return the authenticated user ID, or None if not authenticated."""
+    """Return the authenticated user ID, or None if not authenticated.
+
+    A successfully-authenticated token whose scope forbids this endpoint still
+    raises 403 ``insufficient_scope`` (it is authenticated, just not authorized) —
+    only unauthenticated requests fall through to ``None``.
+    """
     try:
-        user_id, token_iat = _decode_user_id(request, db)
+        user_id, token_iat, scope = _decode_user_id(request, db)
     except HTTPException:
         return None
+
+    _enforce_scope(request, scope)
 
     if is_dev_mode():
         return user_id

@@ -23,7 +23,12 @@ from flyfun_common.db.engine import (
 
 
 def __getattr__(name: str):
-    if name in ("get_db", "current_user_id", "optional_user_id"):
+    if name in (
+        "get_db",
+        "current_user_id",
+        "optional_user_id",
+        "register_scope_paths",
+    ):
         from flyfun_common.db import deps
 
         return getattr(deps, name)
@@ -48,4 +53,5 @@ __all__ = [
     "get_db",
     "current_user_id",
     "optional_user_id",
+    "register_scope_paths",
 ]
