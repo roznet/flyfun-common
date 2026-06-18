@@ -65,11 +65,14 @@ def _oauth_error_redirect(
 
 
 def _validate_redirect_uri(uri: str) -> bool:
-    """Check that a redirect URI is HTTPS (or localhost for dev)."""
+    """HTTPS, http-loopback (dev), or an RFC 8252 private-use scheme (native apps)."""
     parsed = urlparse(uri)
     if parsed.scheme == "https":
         return True
     if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
+        return True
+    # RFC 8252 §7.1 private-use URI scheme — reverse-domain, e.g. net.ro-z.app://cb
+    if parsed.scheme and "." in parsed.scheme and parsed.scheme not in ("http", "https"):
         return True
     return False
 

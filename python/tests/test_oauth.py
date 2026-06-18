@@ -121,6 +121,16 @@ def test_register_client_localhost_allowed(client):
     assert resp.status_code == 200
 
 
+def test_register_client_native_scheme_allowed(client):
+    # RFC 8252 §7.1 private-use URI scheme (reverse-domain) — native iOS/Android apps
+    resp = client.post("/oauth/register", json={
+        "client_name": "Native App",
+        "redirect_uris": ["net.ro-z.flyfun-example://oauth-callback"],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["redirect_uris"] == ["net.ro-z.flyfun-example://oauth-callback"]
+
+
 def test_register_client_invalid_grant_type(client):
     resp = client.post("/oauth/register", json={
         "client_name": "Bad Client",
