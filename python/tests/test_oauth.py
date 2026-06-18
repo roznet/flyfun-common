@@ -194,10 +194,28 @@ def test_authorize_shows_consent_in_dev_mode(client):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": "test-state",
+        "scope": "mcp",
     })
     assert resp.status_code == 200
     assert "Test Client" in resp.text
     assert "Authorize" in resp.text
+
+
+def test_authorize_requires_explicit_scope(client):
+    """An omitted scope is rejected, not silently granted a broad default."""
+    client_id, _ = _register_client(client)
+    _, challenge = _make_challenge()
+
+    resp = client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+    })
+    params = parse_qs(urlparse(_extract_redirect_url(resp)).query)
+    assert params["error"] == ["invalid_scope"]
 
 
 def test_authorize_rejects_unknown_client(client):
@@ -314,6 +332,55 @@ def test_authorize_rejects_invalid_scope(client):
     location = _extract_redirect_url(resp)
     params = parse_qs(urlparse(location).query)
     assert params["error"] == ["invalid_scope"]
+
+
+def _multi_scope_client(db_session):
+    """Test client whose AS supports a narrow read scope and a broad scope."""
+    os.environ["ENVIRONMENT"] = "development"
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test-session-secret")
+    app.include_router(create_oauth_router(
+        app_name="Test App",
+        scopes={
+            "flights:read": ["View your flight list"],
+            "mcp": ["Full access to create and delete flights"],
+        },
+    ))
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+    return TestClient(app, follow_redirects=False)
+
+
+def _consent_html(tc, client_id, scope):
+    _, challenge = _make_challenge()
+    resp = tc.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "scope": scope,
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.text
+
+
+def test_consent_lists_only_requested_scope(db_session):
+    """The consent screen shows exactly the requested scope's permissions —
+    a read request never displays (or grants) broad-scope permissions."""
+    tc = _multi_scope_client(db_session)
+    client_id, _ = _register_client(tc)
+
+    read_html = _consent_html(tc, client_id, "flights:read")
+    assert "View your flight list" in read_html
+    assert "Full access" not in read_html
+
+    broad_html = _consent_html(tc, client_id, "mcp")
+    assert "Full access to create and delete flights" in broad_html
+    assert "View your flight list" not in broad_html
 
 
 # --- Token Exchange Tests ---

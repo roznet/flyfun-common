@@ -171,21 +171,44 @@ def _render_consent_page(
 def create_oauth_router(
     *,
     app_name: str = "FlyFun",
-    scopes_supported: list[str] | None = None,
-    permission_descriptions: list[str] | None = None,
+    scopes: dict[str, list[str]] | None = None,
+    default_scope: str | None = None,
     login_path: str = "/auth/login/google",
     token_expiry_days: int = 7,
 ) -> APIRouter:
-    """Create and return a FastAPI router implementing OAuth 2.1 for MCP clients."""
+    """Create and return a FastAPI router implementing OAuth 2.1 for MCP clients.
 
-    if scopes_supported is None:
-        scopes_supported = ["mcp"]
-    if permission_descriptions is None:
-        permission_descriptions = [
-            "View your flights and briefings",
-            "Create flights and request weather briefings",
-            "View airport weather forecasts",
-        ]
+    ``scopes`` maps each supported scope name to the human-readable permission
+    descriptions shown on the consent screen when that scope is requested. The
+    consent page renders the union of descriptions for exactly the scopes the
+    client asked for — so a ``flights:read`` request never shows (or grants)
+    more than read access, and a broad scope like ``mcp`` shows full access.
+
+    ``default_scope`` is used only when a client omits ``scope`` entirely. It
+    defaults to ``None``, which makes ``scope`` effectively required: an omitted
+    scope is rejected with ``invalid_scope`` rather than silently granting a
+    broad default. Set it to a specific scope only if you deliberately want
+    omitted-scope requests to receive that scope.
+    """
+
+    if scopes is None:
+        scopes = {
+            "mcp": [
+                "View your flights and briefings",
+                "Create flights and request weather briefings",
+                "View airport weather forecasts",
+            ],
+        }
+    scopes_supported = list(scopes)
+
+    def _permissions_for(requested_scopes: list[str]) -> list[str]:
+        """Union of consent descriptions for the requested scopes, in order."""
+        perms: list[str] = []
+        for s in requested_scopes:
+            for description in scopes.get(s, []):
+                if description not in perms:
+                    perms.append(description)
+        return perms
 
     router = APIRouter(tags=["oauth"])
 
@@ -239,7 +262,7 @@ def create_oauth_router(
         code_challenge: str,
         code_challenge_method: str,
         state: str = "",
-        scope: str = "mcp",
+        scope: str | None = None,
         db: Session = Depends(get_db),
     ):
         # Validate response_type
@@ -267,8 +290,15 @@ def create_oauth_router(
             request.session["oauth_next"] = authorize_url
             return RedirectResponse(url=login_path, status_code=302)
 
-        # Validate scope
-        requested_scopes = scope.split()
+        # Resolve + validate scope. An omitted scope falls back to
+        # ``default_scope`` (None by default → required, never a silent grant).
+        requested = scope if scope is not None else default_scope
+        if not requested:
+            return _oauth_error_redirect(
+                redirect_uri, "invalid_scope", state,
+                f"A scope is required. Supported: {' '.join(scopes_supported)}",
+            )
+        requested_scopes = requested.split()
         if not all(s in scopes_supported for s in requested_scopes):
             return _oauth_error_redirect(
                 redirect_uri, "invalid_scope", state,
@@ -287,13 +317,13 @@ def create_oauth_router(
             app_name=app_name,
             client_name=client.client_name or client_id,
             user_email=user_email,
-            permissions=permission_descriptions,
+            permissions=_permissions_for(requested_scopes),
             client_id=client_id,
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             state=state,
-            scope=scope,
+            scope=requested,
             csrf_token=csrf_token,
         )
 
@@ -306,7 +336,7 @@ def create_oauth_router(
         code_challenge: str = Form(...),
         code_challenge_method: str = Form("S256"),
         state: str = Form(""),
-        scope: str = Form("mcp"),
+        scope: str = Form(""),
         csrf_token: str = Form(...),
         db: Session = Depends(get_db),
     ):
@@ -331,6 +361,15 @@ def create_oauth_router(
 
         if action == "deny":
             return _oauth_error_redirect(redirect_uri, "access_denied", state)
+
+        # Re-validate scope server-side. It reaches us in a hidden form field,
+        # so it must not be trusted blindly: a tampered POST must not be able to
+        # widen the scope persisted on the token beyond what the AS supports.
+        requested_scopes = scope.split()
+        if not requested_scopes or not all(
+            s in scopes_supported for s in requested_scopes
+        ):
+            return _oauth_error_redirect(redirect_uri, "invalid_scope", state)
 
         # Generate authorization code
         code = secrets.token_urlsafe(32)
