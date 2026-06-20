@@ -20,6 +20,12 @@ class OAuthClientRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # Source IP of the registration request, for DCR rate-limiting (RFC 7591
+    # registration is open, so abuse is bounded per-IP). Nullable: pre-existing
+    # clients and dev-mode registrations carry no IP.
+    registered_ip: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None
+    )
 
 
 class OAuthAuthorizationCodeRow(Base):

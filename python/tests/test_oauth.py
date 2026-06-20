@@ -165,7 +165,7 @@ def _make_challenge():
     return verifier, challenge
 
 
-def _get_csrf_token(test_client, client_id, challenge, redirect_uri="https://example.com/callback"):
+def _get_csrf_token(test_client, client_id, challenge, redirect_uri="https://example.com/callback", scope="mcp"):
     """GET the consent page and extract the CSRF token from the HTML."""
     resp = test_client.get("/oauth/authorize", params={
         "client_id": client_id,
@@ -174,7 +174,7 @@ def _get_csrf_token(test_client, client_id, challenge, redirect_uri="https://exa
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": "s",
-        "scope": "mcp",
+        "scope": scope,
     })
     assert resp.status_code == 200
     match = re.search(r'name="csrf_token"\s+value="([^"]+)"', resp.text)
@@ -681,3 +681,144 @@ def test_refresh_token_expired(client, db_session):
     })
     assert resp.status_code == 400
     assert "expired" in resp.json()["error_description"].lower()
+
+
+# --- Security hardening: DCR rate limit, consent binding, refresh expiry ---
+
+
+def _prod_client(db_session, monkeypatch, **router_kwargs):
+    """Test client running in production mode (rate limits active)."""
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test-session-secret")
+    app.include_router(create_oauth_router(app_name="Test App", **router_kwargs))
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+    return TestClient(app, follow_redirects=False)
+
+
+def test_register_is_rate_limited_per_ip(db_session, monkeypatch):
+    """DCR is open (RFC 7591) but throttled — past the per-IP/hour cap → 429."""
+    tc = _prod_client(db_session, monkeypatch, register_rate_per_hour=3)
+    for i in range(3):
+        resp = tc.post("/oauth/register", json={
+            "client_name": f"client-{i}",
+            "redirect_uris": ["https://example.com/callback"],
+        })
+        assert resp.status_code == 200, resp.text
+    # 4th registration from the same IP within the window is rejected
+    resp = tc.post("/oauth/register", json={
+        "client_name": "over-limit",
+        "redirect_uris": ["https://example.com/callback"],
+    })
+    assert resp.status_code == 429
+
+
+def test_register_records_source_ip(db_session, monkeypatch):
+    """The registration IP is persisted so the rate limit has something to count."""
+    tc = _prod_client(db_session, monkeypatch, register_rate_per_hour=10)
+    resp = tc.post("/oauth/register", json={
+        "client_name": "ip-client",
+        "redirect_uris": ["https://example.com/callback"],
+    })
+    assert resp.status_code == 200
+    row = (
+        db_session.query(OAuthClientRow)
+        .filter(OAuthClientRow.id == resp.json()["client_id"])
+        .first()
+    )
+    assert row.registered_ip  # TestClient default host is "testclient"
+
+
+def test_consent_post_rejects_scope_swap(db_session):
+    """A POST whose hidden fields differ from the consent the user was shown
+    (here: scope widened from flights:read to mcp) is rejected — the approval
+    is bound to the exact request, so a CSRF'd/swapped POST can't grant more."""
+    tc = _multi_scope_client(db_session)
+    client_id, _ = _register_client(tc)
+    _, challenge = _make_challenge()
+
+    # User is shown — and consents to — the narrow flights:read scope.
+    csrf = _get_csrf_token(tc, client_id, challenge, scope="flights:read")
+
+    # Attacker-tampered POST tries to widen scope to the broad mcp scope,
+    # reusing the same (valid) CSRF token.
+    resp = tc.post("/oauth/authorize", data={
+        "action": "approve",
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+        "scope": "mcp",
+        "csrf_token": csrf,
+    }, follow_redirects=False)
+    assert resp.status_code == 403
+
+
+def test_consent_post_matching_request_succeeds(db_session):
+    """The same flow with the scope the user actually consented to is allowed."""
+    tc = _multi_scope_client(db_session)
+    client_id, _ = _register_client(tc)
+    _, challenge = _make_challenge()
+    csrf = _get_csrf_token(tc, client_id, challenge, scope="flights:read")
+    resp = tc.post("/oauth/authorize", data={
+        "action": "approve",
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+        "scope": "flights:read",
+        "csrf_token": csrf,
+    }, follow_redirects=False)
+    location = _extract_redirect_url(resp)
+    params = parse_qs(urlparse(location).query)
+    assert "code" in params
+
+
+def test_refresh_token_gets_sliding_expiry(client, db_session):
+    """Issued and rotated refresh tokens carry a bounded (sliding) expiry,
+    rather than living forever."""
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    before = datetime.now(timezone.utc)
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "code_verifier": verifier,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    tokens = resp.json()
+
+    def _expiry_window(refresh_token):
+        rt = (
+            db_session.query(OAuthRefreshTokenRow)
+            .filter_by(token_hash=hash_token(refresh_token))
+            .first()
+        )
+        assert rt.expires_at is not None, "refresh token must have an expiry"
+        exp = rt.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return exp - before
+
+    # Default window is 90 days, sliding.
+    assert timedelta(days=89, hours=23) < _expiry_window(tokens["refresh_token"]) < timedelta(days=90, hours=1)
+
+    # Rotation also re-stamps the expiry (sliding), not leaving it unset.
+    resp = client.post("/oauth/token", data={
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    rotated = resp.json()
+    assert timedelta(days=89, hours=23) < _expiry_window(rotated["refresh_token"]) < timedelta(days=90, hours=1)

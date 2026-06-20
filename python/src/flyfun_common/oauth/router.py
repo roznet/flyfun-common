@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import secrets
@@ -12,9 +13,11 @@ from urllib.parse import quote, urlencode, urlparse
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from flyfun_common.admin import generate_api_token, hash_token
+from flyfun_common.auth.config import is_dev_mode
 from flyfun_common.db.deps import get_db, optional_user_id
 from flyfun_common.db.models import ApiTokenRow, UserRow
 from flyfun_common.oauth.models import (
@@ -75,6 +78,22 @@ def _validate_redirect_uri(uri: str) -> bool:
     if parsed.scheme and "." in parsed.scheme and parsed.scheme not in ("http", "https"):
         return True
     return False
+
+
+def _consent_fingerprint(
+    client_id: str, redirect_uri: str, scope: str, code_challenge: str
+) -> str:
+    """Stable hash of the request-defining authorization params.
+
+    Stored in the session at consent-render time and re-checked on the consent
+    POST so an "Authorize" can only ever grant the *exact* client / redirect /
+    scope / PKCE challenge the user was shown — a CSRF'd or swapped POST that
+    carries different hidden fields no longer matches the session and is
+    rejected. Without this, the CSRF token alone is not bound to any particular
+    request, so a single valid token could approve a different client/scope.
+    """
+    raw = "\x1f".join([client_id, redirect_uri, scope or "", code_challenge])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _render_consent_page(
@@ -175,6 +194,9 @@ def create_oauth_router(
     default_scope: str | None = None,
     login_path: str = "/auth/login/google",
     token_expiry_days: int = 7,
+    refresh_token_days: int = 90,
+    register_rate_per_hour: int = 5,
+    register_global_per_hour: int = 50,
 ) -> APIRouter:
     """Create and return a FastAPI router implementing OAuth 2.1 for MCP clients.
 
@@ -189,6 +211,16 @@ def create_oauth_router(
     scope is rejected with ``invalid_scope`` rather than silently granting a
     broad default. Set it to a specific scope only if you deliberately want
     omitted-scope requests to receive that scope.
+
+    ``refresh_token_days`` bounds OAuth refresh-token lifetime. Expiry is
+    *sliding* — each rotation issues a token valid for another window — so an
+    actively-used connector never forces a re-login, while a refresh token for a
+    connection left idle past the window (or a leaked, forgotten one) expires.
+
+    ``register_rate_per_hour`` / ``register_global_per_hour`` throttle Dynamic
+    Client Registration (RFC 7591 keeps registration open, but unbounded it is a
+    DB-spam / consent-phishing-client factory): a per-IP and a global sliding
+    window over the last hour, both skipped in dev mode.
     """
 
     if scopes is None:
@@ -215,7 +247,44 @@ def create_oauth_router(
     # ---- Dynamic Client Registration (RFC 7591) ----
 
     @router.post("/oauth/register")
-    async def register(body: RegisterRequest, db: Session = Depends(get_db)):
+    async def register(
+        body: RegisterRequest, request: Request, db: Session = Depends(get_db)
+    ):
+        # Throttle open registration (RFC 7591) so it can't be used as an
+        # unbounded DB-spam / phishing-client factory. Sliding windows over the
+        # natural oauth_clients log: per source IP, plus a global backstop.
+        client_ip = request.client.host if request.client else None
+        if not is_dev_mode():
+            window_start = datetime.now(timezone.utc) - timedelta(hours=1)
+            if client_ip:
+                ip_count = (
+                    db.query(func.count(OAuthClientRow.id))
+                    .filter(
+                        OAuthClientRow.registered_ip == client_ip,
+                        OAuthClientRow.created_at >= window_start,
+                    )
+                    .scalar()
+                    or 0
+                )
+                if ip_count >= register_rate_per_hour:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Too many client registrations from this address; "
+                        "try again later.",
+                    )
+            global_count = (
+                db.query(func.count(OAuthClientRow.id))
+                .filter(OAuthClientRow.created_at >= window_start)
+                .scalar()
+                or 0
+            )
+            if global_count >= register_global_per_hour:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Client registration is temporarily unavailable; "
+                    "try again later.",
+                )
+
         # Validate redirect URIs
         for uri in body.redirect_uris:
             if not _validate_redirect_uri(uri):
@@ -239,6 +308,7 @@ def create_oauth_router(
             client_secret_hash=hash_token(client_secret),
             client_name=body.client_name,
             redirect_uris_json=json.dumps(body.redirect_uris),
+            registered_ip=client_ip,
         )
         db.add(row)
         db.flush()
@@ -309,9 +379,14 @@ def create_oauth_router(
         user = db.query(UserRow).filter(UserRow.id == user_id).first()
         user_email = user.email if user else user_id
 
-        # Generate CSRF token and store in session
+        # Generate CSRF token and store in session, together with a fingerprint
+        # of *this* request's defining params so the eventual POST can only
+        # approve the exact client/redirect/scope/challenge shown here.
         csrf_token = secrets.token_urlsafe(32)
         request.session["oauth_csrf"] = csrf_token
+        request.session["oauth_consent_fp"] = _consent_fingerprint(
+            client_id, redirect_uri, requested, code_challenge
+        )
 
         return _render_consent_page(
             app_name=app_name,
@@ -361,6 +436,20 @@ def create_oauth_router(
 
         if action == "deny":
             return _oauth_error_redirect(redirect_uri, "access_denied", state)
+
+        # Bind the grant to the request the user actually consented to: the
+        # POST's params must hash to the fingerprint stored when the consent
+        # page was rendered. Defeats consent/scope swap even if the CSRF token
+        # is replayed (a different client/redirect/scope won't match). Enforced
+        # only on the approve path — a deny grants nothing.
+        expected_fp = request.session.get("oauth_consent_fp")
+        submitted_fp = _consent_fingerprint(
+            client_id, redirect_uri, scope, code_challenge
+        )
+        if not expected_fp or not hmac.compare_digest(submitted_fp, expected_fp):
+            raise HTTPException(
+                status_code=403, detail="Consent does not match the authorized request"
+            )
 
         # Re-validate scope server-side. It reaches us in a hidden form field,
         # so it must not be trusted blindly: a tampered POST must not be able to
@@ -437,11 +526,12 @@ def create_oauth_router(
 
         if grant_type == "authorization_code":
             return _handle_authorization_code(
-                db, client, code, redirect_uri, code_verifier, token_expiry_days
+                db, client, code, redirect_uri, code_verifier,
+                token_expiry_days, refresh_token_days,
             )
         elif grant_type == "refresh_token":
             return _handle_refresh_token(
-                db, client, refresh_token, token_expiry_days
+                db, client, refresh_token, token_expiry_days, refresh_token_days
             )
         else:
             return JSONResponse(
@@ -461,6 +551,7 @@ def _handle_authorization_code(
     redirect_uri: str | None,
     code_verifier: str | None,
     token_expiry_days: int,
+    refresh_token_days: int,
 ) -> JSONResponse:
     if not code or not redirect_uri or not code_verifier:
         return JSONResponse(
@@ -566,6 +657,7 @@ def _handle_authorization_code(
             user_id=auth_code.user_id,
             access_token_hash=access_hash,
             scope=auth_code.scope,
+            expires_at=now + timedelta(days=refresh_token_days),
         )
     )
     db.flush()
@@ -584,6 +676,7 @@ def _handle_refresh_token(
     client: OAuthClientRow,
     refresh_token_str: str | None,
     token_expiry_days: int,
+    refresh_token_days: int,
 ) -> JSONResponse:
     if not refresh_token_str:
         return JSONResponse(
@@ -656,6 +749,7 @@ def _handle_refresh_token(
             user_id=rt.user_id,
             access_token_hash=access_hash,
             scope=rt.scope,
+            expires_at=now + timedelta(days=refresh_token_days),
         )
     )
     db.flush()
