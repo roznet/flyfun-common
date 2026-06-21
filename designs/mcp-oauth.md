@@ -260,7 +260,15 @@ This is a server-rendered HTML page (not a SPA route) since it must work in a po
 
 ## Security Considerations
 
-- **PKCE required** (S256 only) — prevents authorization code interception
+- **PKCE optional, enforced-when-present** (S256 only) — since `0.6.1`. A public
+  client (e.g. the Claude/MCP connector) that sends a `code_challenge` gets it
+  verified end-to-end and cannot be downgraded (enforcement keys off the challenge
+  stored with the code). A confidential client that omits PKCE (e.g. a ChatGPT GPT
+  Action) is allowed because the token endpoint *always* requires a valid
+  `client_secret` — so every flow is protected by PKCE **or** client_secret, never
+  neither. Before `0.6.1` PKCE was mandatory, which 422'd ChatGPT GPT Actions at
+  `/oauth/authorize` (they don't send PKCE). See `test_token_exchange_without_secret_still_rejected`
+  for the invariant that keeps this safe.
 - **Client secrets hashed** in DB (same as api_tokens)
 - **Authorization codes**: single-use, 10-minute expiry; replay revokes all tokens issued from that code (RFC 6749 §10.5)
 - **CSRF protection**: consent form includes a session-bound CSRF token, validated on POST with constant-time comparison
