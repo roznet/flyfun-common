@@ -822,3 +822,90 @@ def test_refresh_token_gets_sliding_expiry(client, db_session):
     })
     rotated = resp.json()
     assert timedelta(days=89, hours=23) < _expiry_window(rotated["refresh_token"]) < timedelta(days=90, hours=1)
+
+
+# --- Non-PKCE confidential-client flow (e.g. ChatGPT GPT Actions) ---
+#
+# PKCE is optional: enforced-when-present (public clients like Claude), omittable
+# for a confidential client that authenticates with its client_secret at the
+# token endpoint. The invariant that keeps this safe — a code can NEVER be
+# redeemed with neither PKCE nor secret — is locked by the last test below.
+
+
+def _csrf_no_pkce(test_client, client_id, redirect_uri="https://example.com/callback", scope="mcp"):
+    """GET the consent page WITHOUT a PKCE challenge; return the CSRF token."""
+    resp = test_client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "state": "s",
+        "scope": scope,
+    })
+    assert resp.status_code == 200, resp.text
+    match = re.search(r'name="csrf_token"\s+value="([^"]+)"', resp.text)
+    assert match, "CSRF token not found in consent page"
+    return match.group(1)
+
+
+def _approve_no_pkce(test_client, client_id, redirect_uri="https://example.com/callback"):
+    """Approve a consent that carried no PKCE challenge; return the auth code."""
+    csrf = _csrf_no_pkce(test_client, client_id, redirect_uri)
+    resp = test_client.post("/oauth/authorize", data={
+        "action": "approve",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": "mystate",
+        "scope": "mcp",
+        "csrf_token": csrf,
+    }, follow_redirects=False)
+    location = _extract_redirect_url(resp)
+    return parse_qs(urlparse(location).query)["code"][0]
+
+
+def test_authorize_allows_missing_pkce(client):
+    """A confidential client may omit code_challenge — authorize must not 422."""
+    client_id, _ = _register_client(client)
+    resp = client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": "https://example.com/callback",
+        "response_type": "code",
+        "state": "s",
+        "scope": "mcp",
+    })
+    assert resp.status_code == 200, resp.text
+
+
+def test_token_exchange_without_pkce(client, db_session):
+    """Full non-PKCE flow: authorize (no challenge) -> token (no verifier),
+    authenticated solely by client_secret. Mirrors a ChatGPT GPT Action."""
+    client_id, client_secret = _register_client(client)
+    code = _approve_no_pkce(client, client_id)
+
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        # no code_verifier
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["access_token"].startswith("ff_")
+
+
+def test_token_exchange_without_secret_still_rejected(client):
+    """SECURITY INVARIANT: a code can never be redeemed with neither PKCE nor a
+    client_secret. Dropping both must fail — this is what keeps optional-PKCE
+    safe (the secret is the protection PKCE would otherwise provide)."""
+    client_id, _ = _register_client(client)
+    code = _approve_no_pkce(client, client_id)
+
+    resp = client.post("/oauth/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "client_id": client_id,
+        # no client_secret, no code_verifier
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_client"

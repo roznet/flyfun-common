@@ -329,8 +329,8 @@ def create_oauth_router(
         client_id: str,
         redirect_uri: str,
         response_type: str,
-        code_challenge: str,
-        code_challenge_method: str,
+        code_challenge: str | None = None,
+        code_challenge_method: str | None = None,
         state: str = "",
         scope: str | None = None,
         db: Session = Depends(get_db),
@@ -338,7 +338,14 @@ def create_oauth_router(
         # Validate response_type
         if response_type != "code":
             raise HTTPException(status_code=400, detail="response_type must be 'code'")
-        if code_challenge_method != "S256":
+        # PKCE is optional: enforced-when-present, omittable-when-absent. A public
+        # client (e.g. the Claude/MCP connector) sends a challenge and gets it
+        # verified end-to-end; a confidential client that authenticates with its
+        # client_secret at the token endpoint (e.g. a ChatGPT GPT Action) may omit
+        # it. Normalize to "" so the empty case never carries None downstream.
+        code_challenge = code_challenge or ""
+        code_challenge_method = code_challenge_method or ""
+        if code_challenge and code_challenge_method != "S256":
             raise HTTPException(
                 status_code=400, detail="code_challenge_method must be 'S256'"
             )
@@ -408,7 +415,7 @@ def create_oauth_router(
         action: str = Form(...),
         client_id: str = Form(...),
         redirect_uri: str = Form(...),
-        code_challenge: str = Form(...),
+        code_challenge: str = Form(""),
         code_challenge_method: str = Form("S256"),
         state: str = Form(""),
         scope: str = Form(""),
@@ -553,7 +560,7 @@ def _handle_authorization_code(
     token_expiry_days: int,
     refresh_token_days: int,
 ) -> JSONResponse:
-    if not code or not redirect_uri or not code_verifier:
+    if not code or not redirect_uri:
         return JSONResponse(
             {"error": "invalid_request", "error_description": "Missing required parameters"},
             status_code=400,
@@ -617,12 +624,17 @@ def _handle_authorization_code(
             status_code=400,
         )
 
-    # PKCE verification
-    if not verify_pkce_s256(code_verifier, auth_code.code_challenge):
-        return JSONResponse(
-            {"error": "invalid_grant", "error_description": "PKCE verification failed"},
-            status_code=400,
-        )
+    # PKCE verification — enforced only when the code was issued with a
+    # challenge (public clients). A confidential client that omitted PKCE is
+    # already authenticated by its client_secret, validated above.
+    if auth_code.code_challenge:
+        if not code_verifier or not verify_pkce_s256(
+            code_verifier, auth_code.code_challenge
+        ):
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+                status_code=400,
+            )
 
     # Mark code as used
     auth_code.used = True
