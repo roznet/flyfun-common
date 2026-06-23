@@ -139,6 +139,27 @@ def get_user_total_usd(
     return float(q.scalar())
 
 
+def list_user_donations(
+    db: Session,
+    user_id: str,
+    service: str | None = None,
+    limit: int = 100,
+) -> list[DonationRow]:
+    """Return a user's succeeded donations, newest first (refunds excluded).
+
+    The per-donation companion to :func:`get_user_total_usd` — for showing a
+    contribution history (date + amount) rather than just the running total.
+    ``limit`` caps the rows returned (newest kept).
+    """
+    q = db.query(DonationRow).filter(
+        DonationRow.user_id == user_id,
+        DonationRow.status == "succeeded",
+    )
+    if service:
+        q = q.filter(DonationRow.service == service)
+    return q.order_by(DonationRow.created_at.desc()).limit(limit).all()
+
+
 def get_year_total_usd(
     db: Session, year: int, service: str | None = None
 ) -> float:

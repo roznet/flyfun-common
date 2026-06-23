@@ -78,6 +78,29 @@ class CheckoutDonation:
     payment_intent_id: str | None  # for the fee-ratio lookup; None for subscriptions
 
 
+@dataclass(frozen=True)
+class CheckoutReceipt:
+    """Donor-facing receipt fields pulled from a retrieved Checkout Session.
+
+    Used to confirm a completed donation back to the donor (e.g. an opt-in email
+    receipt from the post-donation thank-you page). Unlike
+    :class:`CheckoutDonation` — which the *webhook* parses to record the donation
+    — this is fetched on demand via :func:`retrieve_checkout_receipt`, so it can
+    carry the donor ``email`` Stripe collected at Checkout and the session
+    ``created`` timestamp, which the redirect query string does not. ``amount``
+    is in major units of ``currency``.
+    """
+
+    session_id: str
+    service: str
+    user_id: str | None  # the donor's account id, if the donation was attributed
+    payment_status: str  # "paid" | "unpaid" | "no_payment_required"
+    amount: float
+    currency: str  # ISO 4217, uppercase
+    email: str | None  # address the donor entered at Checkout (may be absent)
+    created: int | None  # Unix timestamp of the session
+
+
 def _as_plain_dict(obj: object) -> dict:
     """Coerce a Stripe ``StripeObject`` (or dict) to a plain nested dict.
 
@@ -237,3 +260,38 @@ def retrieve_net_ratio(payment_intent_id: str) -> float | None:
     if not gross:
         return None
     return net / gross
+
+
+def retrieve_checkout_receipt(session_id: str) -> CheckoutReceipt:
+    """Retrieve a Checkout Session and pull donor-facing receipt fields.
+
+    Used by the post-donation thank-you flow to confirm a completed donation
+    back to the donor (date, amount, and the email Stripe collected at
+    Checkout). Reading straight from Stripe — rather than the local ledger —
+    avoids a race with the asynchronous webhook and yields the donor email even
+    for anonymous donations.
+
+    The caller should gate on ``payment_status == "paid"`` before trusting the
+    receipt. Raises :class:`StripeNotConfigured` when no key is set; Stripe SDK
+    errors (e.g. an unknown ``session_id``) propagate to the caller.
+    """
+    _configure()
+    session = _as_plain_dict(stripe.checkout.Session.retrieve(session_id))
+    currency = (session.get("currency") or "usd").upper()
+    amount_total = session.get("amount_total") or 0
+    metadata = session.get("metadata") or {}
+    details = session.get("customer_details") or {}
+    email = details.get("email") or session.get("customer_email") or None
+    # client_reference_id is the primary attribution; metadata is the backup
+    # (mirrors extract_donation_from_session).
+    user_id = session.get("client_reference_id") or metadata.get("user_id") or None
+    return CheckoutReceipt(
+        session_id=session.get("id") or session_id,
+        service=metadata.get("service") or "",
+        user_id=user_id,
+        payment_status=session.get("payment_status") or "unpaid",
+        amount=from_minor_units(amount_total, currency),
+        currency=currency,
+        email=email,
+        created=session.get("created"),
+    )
