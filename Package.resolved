@@ -1,5 +1,5 @@
 {
-  "originHash" : "4bb4d163386f96e69bff1f3700256df1e4ef5067eaacf3eef9cc1433bb4adae4",
+  "originHash" : "244bed0c6400ed689ff68f476d99a4711f01ed9c826099262de3eba3ff0ca173",
   "pins" : [
     {
       "identity" : "fmdb",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/roznet/rzutils",
       "state" : {
-        "revision" : "26465b73e220f1cfe77a6ac586d89ec73225d71a",
-        "version" : "1.0.30"
+        "revision" : "e2c66339b9dfdf88ba11be04561ea659f8afddcc",
+        "version" : "1.0.31"
       }
     }
   ],

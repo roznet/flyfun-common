@@ -15,7 +15,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/roznet/rzutils", from: "1.0.30"),
+        .package(url: "https://github.com/roznet/rzutils", from: "1.0.31"),
     ],
     targets: [
         .target(

@@ -10,10 +10,14 @@ public final class KeychainBearerTokenStore: BearerTokenStore, @unchecked Sendab
     private var storage: CodableSecureStorage<Key, String>
 
     public init(service: String, accessGroup: String? = nil) {
+        // Bind the token to this device: accessible only after first unlock and
+        // never migrated to another device via encrypted backup or iCloud
+        // Keychain. A session JWT should not survive a restore onto new hardware.
         self.storage = CodableSecureStorage(
             key: .bearerToken,
             service: service,
-            accessGroup: accessGroup
+            accessGroup: accessGroup,
+            accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         )
     }
 
