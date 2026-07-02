@@ -358,8 +358,9 @@ def test_callback_ignores_next_for_ios(callback_app):
     )
     r2 = client.get("/auth/callback/google", follow_redirects=False)
     assert r2.status_code == 302
-    # iOS flow goes to the custom scheme, not the next path.
-    assert r2.headers["location"].startswith("flyfun://auth/callback?token=")
+    # iOS flow goes to the custom scheme (auth-code flow: a one-time code, never
+    # the token), not the next path.
+    assert r2.headers["location"].startswith("flyfun://auth/callback?code=")
 
 
 def test_callback_no_next_redirects_home(callback_app):

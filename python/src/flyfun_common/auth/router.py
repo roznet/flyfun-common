@@ -29,12 +29,18 @@ from flyfun_common.auth.config import (
     COOKIE_NAME,
     SUPPORTED_PROVIDERS,
     create_oauth,
+    get_allowed_callback_schemes,
     get_cookie_domain,
     get_jwt_secret,
     get_session_cookie_attrs,
     is_dev_mode,
 )
-from flyfun_common.auth.jwt_utils import create_token, get_jwt_cookie_max_age
+from flyfun_common.auth.jwt_utils import (
+    create_exchange_code,
+    create_token,
+    decode_exchange_code,
+    get_jwt_cookie_max_age,
+)
 from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
 
@@ -43,6 +49,9 @@ logger = logging.getLogger(__name__)
 # Apple's JWKS endpoint for verifying identity tokens
 _APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 _apple_jwks_client: pyjwt.PyJWKClient | None = None
+
+# Client-generated OAuth `state` nonce: opaque, URL-safe, bounded length.
+_OAUTH_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 def _is_safe_relative_path(value: str) -> bool:
@@ -179,6 +188,13 @@ class AppleTokenRequest(BaseModel):
     last_name: str | None = None
 
 
+class ExchangeCodeRequest(BaseModel):
+    """Request body for the native auth-code exchange (POST /auth/exchange)."""
+
+    code: str
+    state: str | None = None
+
+
 def create_auth_router(
     on_new_user: callable | None = None,
     on_delete_user: callable | None = None,
@@ -228,10 +244,21 @@ def create_auth_router(
         request: Request,
         platform: str | None = None,
         scheme: str | None = None,
+        state: str | None = None,
         next: str | None = None,
     ):
         if provider not in SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
+        # Validate untrusted input BEFORE touching the OAuth client / session.
+        if scheme is not None:
+            # Exact-match allowlist (replaces the old loose flyfun* regex): a
+            # second app registering a flyfun* scheme must not receive the
+            # callback.
+            if scheme not in get_allowed_callback_schemes():
+                raise HTTPException(status_code=400, detail="Invalid URL scheme")
+        if state is not None and not _OAUTH_STATE_RE.fullmatch(state):
+            raise HTTPException(status_code=400, detail="Invalid state")
+
         client = _get_oauth_client(provider)
         redirect_uri = request.url_for("callback", provider=provider)
         if not is_dev_mode():
@@ -239,12 +266,12 @@ def create_auth_router(
         if platform:
             request.session["oauth_platform"] = platform
         if scheme:
-            if not re.fullmatch(r"flyfun[a-z0-9\-]*", scheme):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid URL scheme",
-                )
             request.session["oauth_scheme"] = scheme
+        # Client-generated nonce for the native auth-code flow. Bound into the
+        # exchange code and re-checked at /auth/exchange so an injected callback
+        # can't authenticate a victim (login-CSRF).
+        if state:
+            request.session["oauth_state"] = state
         # Post-login redirect — honored only on browser/web flow, not native iOS.
         # Silently dropped if it doesn't pass open-redirect validation.
         if next and platform != "ios" and _is_safe_relative_path(next):
@@ -299,18 +326,26 @@ def create_auth_router(
         if not user.approved:
             return RedirectResponse(url="/login.html?status=pending", status_code=302)
 
-        jwt_token = create_token(
-            user.id, user.email, user.display_name, get_jwt_secret()
-        )
-
-        # iOS/native app: redirect to app-specific custom URL scheme
+        # iOS/native app: redirect to the app-specific custom URL scheme.
         platform = request.session.pop("oauth_platform", None)
         # iOS flow doesn't honor post-login redirect — the app owns navigation.
         post_login_redirect = request.session.pop("post_login_redirect", None)
         if platform == "ios":
             scheme = request.session.pop("oauth_scheme", "flyfun")
-            redirect_url = f"{scheme}://auth/callback?token={quote(jwt_token)}"
+            state = request.session.pop("oauth_state", "")
+            # Auth-code flow: hand back a short-TTL, single-use CODE bound to
+            # `state`, never the session JWT. The app POSTs it to /auth/exchange
+            # over HTTPS to get the token in a response body. Keeps the bearer
+            # token out of URLs/logs and closes the login-CSRF vector.
+            code = create_exchange_code(user.id, state, get_jwt_secret())
+            redirect_url = f"{scheme}://auth/callback?code={quote(code)}"
+            if state:
+                redirect_url += f"&state={quote(state)}"
             return RedirectResponse(url=redirect_url, status_code=302)
+
+        jwt_token = create_token(
+            user.id, user.email, user.display_name, get_jwt_secret()
+        )
 
         # Resume OAuth authorize flow if we were redirected here from /oauth/authorize
         oauth_next = request.session.pop("oauth_next", None)
@@ -324,6 +359,40 @@ def create_auth_router(
         response = RedirectResponse(url=target, status_code=302)
         _set_session_cookie(response, jwt_token)
         return response
+
+    @router.post("/exchange")
+    async def exchange(
+        body: ExchangeCodeRequest,
+        request: Request,
+        db: Session = Depends(get_db),
+    ):
+        """Trade a native auth-code for the session JWT (auth-code flow).
+
+        The code is a short-TTL signed JWT minted by the OAuth callback. We
+        verify its signature/expiry, require its bound ``state`` to match the
+        one the client presents (login-CSRF defense), then return the real
+        session token in the JSON body — never in a URL.
+        """
+        try:
+            claims = decode_exchange_code(body.code, get_jwt_secret())
+        except pyjwt.InvalidTokenError:
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+        # Constant-time-ish equality is unnecessary here (state is not a secret,
+        # it's an anti-injection nonce), but the match must be exact.
+        if claims.get("state", "") != (body.state or ""):
+            raise HTTPException(status_code=400, detail="State mismatch")
+
+        user = db.get(UserRow, claims.get("uid"))
+        if user is None:
+            raise HTTPException(status_code=400, detail="Invalid code")
+        if not user.approved:
+            raise HTTPException(status_code=403, detail="Account is pending approval")
+
+        jwt_token = create_token(
+            user.id, user.email, user.display_name, get_jwt_secret()
+        )
+        return {"token": jwt_token, "user_id": user.id}
 
     # --- Native iOS Sign in with Apple ---
 

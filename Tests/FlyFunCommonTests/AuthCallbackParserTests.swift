@@ -62,4 +62,45 @@ struct AuthCallbackParserTests {
         let url = URL(string: "https://evil.example.com/auth/callback?token=xyz")!
         #expect(parser.token(from: url) == nil)
     }
+
+    // MARK: - Auth-code flow
+
+    @Test func extractsCodeAndStateFromCustomScheme() {
+        let parser = AuthCallbackParser(customScheme: "flyfunweather")
+        let url = URL(string: "flyfunweather://auth/callback?code=one-time-code&state=nonce123")!
+        let result = parser.codeAndState(from: url)
+        #expect(result?.code == "one-time-code")
+        #expect(result?.state == "nonce123")
+    }
+
+    @Test func extractsCodeWithoutState() {
+        let parser = AuthCallbackParser(customScheme: "flyfunweather")
+        let url = URL(string: "flyfunweather://auth/callback?code=one-time-code")!
+        let result = parser.codeAndState(from: url)
+        #expect(result?.code == "one-time-code")
+        #expect(result?.state == nil)
+    }
+
+    @Test func codeAndStateRejectsMissingCode() {
+        let parser = AuthCallbackParser(customScheme: "flyfunweather")
+        let url = URL(string: "flyfunweather://auth/callback?state=nonce123")!
+        #expect(parser.codeAndState(from: url) == nil)
+    }
+
+    @Test func codeAndStateRejectsWrongScheme() {
+        let parser = AuthCallbackParser(customScheme: "flyfunweather")
+        let url = URL(string: "evilapp://auth/callback?code=stolen")!
+        #expect(parser.codeAndState(from: url) == nil)
+    }
+
+    @Test func codeAndStateFromUniversalLink() {
+        let parser = AuthCallbackParser(
+            customScheme: "flyfunweather",
+            universalLinkHost: "weather.flyfun.aero"
+        )
+        let url = URL(string: "https://weather.flyfun.aero/auth/callback?code=c1&state=s1")!
+        let result = parser.codeAndState(from: url)
+        #expect(result?.code == "c1")
+        #expect(result?.state == "s1")
+    }
 }
