@@ -348,7 +348,27 @@ def test_callback_drops_absolute_next(callback_app):
     assert r2.headers["location"] == "/"
 
 
-def test_callback_ignores_next_for_ios(callback_app):
+def test_callback_ios_with_state_emits_code(callback_app):
+    """New client (sends `state`) → auth-code flow: custom scheme with a
+    code+state, never a token, and it ignores `next`."""
+    app, _ = callback_app
+    client = TestClient(app)
+    client.get(
+        "/auth/login/google",
+        params={"platform": "ios", "state": "teststate123", "next": "/path"},
+        follow_redirects=False,
+    )
+    r2 = client.get("/auth/callback/google", follow_redirects=False)
+    assert r2.status_code == 302
+    loc = r2.headers["location"]
+    assert loc.startswith("flyfun://auth/callback?code=")
+    assert "state=teststate123" in loc
+    assert "token=" not in loc  # migrated clients never get a token in the URL
+
+
+def test_callback_ios_legacy_no_state_emits_token(callback_app):
+    """Legacy client (no `state`) → backward-compat token param so
+    not-yet-updated builds still sign in."""
     app, _ = callback_app
     client = TestClient(app)
     client.get(
@@ -358,9 +378,9 @@ def test_callback_ignores_next_for_ios(callback_app):
     )
     r2 = client.get("/auth/callback/google", follow_redirects=False)
     assert r2.status_code == 302
-    # iOS flow goes to the custom scheme (auth-code flow: a one-time code, never
-    # the token), not the next path.
-    assert r2.headers["location"].startswith("flyfun://auth/callback?code=")
+    loc = r2.headers["location"]
+    assert loc.startswith("flyfun://auth/callback?token=")
+    assert "code=" not in loc
 
 
 def test_callback_no_next_redirects_home(callback_app):
