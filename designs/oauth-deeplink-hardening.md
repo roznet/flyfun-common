@@ -7,20 +7,27 @@ Related: [ios-auth.md](ios-auth.md), [auth.md](auth.md).
 
 ## What shipped (deviations from the original design below)
 
-Two simplifications were chosen because the weather app's **first** App Store
-release has no installed user base to migrate:
-
-1. **v1-direct, no dual-emit.** The 3-phase backward-compatible migration
-   (§Migration) was skipped. The iOS callback emits **only** `code`+`state`
-   (never `token`) from day one. Existing beta testers simply re-authenticate on
-   the new build (accepted trade-off). Already-signed-in / rolling-token users
-   are unaffected regardless.
-2. **Stateless signed code, no DB store.** The one-time code is a 60-second
-   JWT (`purpose:"oauth_exchange"`, `uid`, `state`) signed with `JWT_SECRET`
-   (`jwt_utils.create_exchange_code` / `decode_exchange_code`), not a row in a
-   single-use store. The `state` binding is what actually closes login-CSRF; the
-   60 s TTL plus the private `ASWebAuthenticationSession` channel make replay a
-   non-issue. No migration required.
+1. **State-gated emission (not the original always-emit-both).** The iOS
+   callback emits `code`+`state` **when the client sends a `state`** (new clients
+   signal code-flow capability this way), and otherwise falls back to the legacy
+   `token=` param. Since this is shared multi-app code, the fallback keeps
+   not-yet-updated builds of *other* consuming apps (e.g. flyfunforms) signing in
+   without a flag-day, while **migrated clients never get a token in the URL** —
+   they always send `state`, so they always get the code flow. This is stronger
+   than the original Phase-1 (which reintroduced `token=` for everyone): each app
+   migrates on its own cadence and gets full hardening the moment it does. Drop
+   the legacy branch once every consuming app sends `state`.
+2. **Stateless signed code, no DB store.** The code is a 60-second JWT
+   (`purpose:"oauth_exchange"`, `uid`, `state`) signed with `JWT_SECRET`
+   (`jwt_utils.create_exchange_code` / `decode_exchange_code`), **not** a
+   single-use store. The `state` binding closes login-CSRF. It is deliberately
+   **not single-use**: the short TTL bounds replay rather than eliminating it —
+   a leaked `code`+`state` callback URL can be replayed within 60 s to mint the
+   user's session. **Accepted residual**, because `ASWebAuthenticationSession`
+   captures the callback privately (not broadcast to other apps) and the window
+   is short; the realistic leak surface is server/proxy 302 logs. To close it,
+   add delete-on-read via a `jti` in the existing short-TTL store (the original
+   design's approach).
 
 Code map: server — `auth/router.py` (`/auth/login` state+scheme allowlist,
 callback mints code, new `POST /auth/exchange`), `auth/config.py`

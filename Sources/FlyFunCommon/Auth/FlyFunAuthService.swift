@@ -53,7 +53,7 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
     /// an HTTPS POST. This keeps the bearer token out of URLs and closes the
     /// login-CSRF vector an injected callback would otherwise open.
     public func signIn(provider: String = "google") async throws -> String {
-        let state = Self.generateState()
+        let state = try Self.generateState()
         let loginURL = config.baseURL.appendingPathComponent("auth/login/\(provider)")
         var components = URLComponents(url: loginURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [
@@ -133,10 +133,14 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
     }
 
     /// A URL-safe random `state` nonce (matches the server's
-    /// `[A-Za-z0-9_-]{8,128}` validation).
-    private static func generateState() -> String {
+    /// `[A-Za-z0-9_-]{8,128}` validation). Throws if the CSPRNG fails rather
+    /// than falling back to a predictable all-zero nonce.
+    private static func generateState() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 24)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            logger.error("SecRandomCopyBytes failed generating auth state")
+            throw URLError(.cannotCreateFile)
+        }
         return Data(bytes).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")

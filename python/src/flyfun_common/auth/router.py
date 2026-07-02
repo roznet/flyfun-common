@@ -331,16 +331,31 @@ def create_auth_router(
         # iOS flow doesn't honor post-login redirect — the app owns navigation.
         post_login_redirect = request.session.pop("post_login_redirect", None)
         if platform == "ios":
+            # `scheme` was validated against the allowlist at /auth/login; the
+            # "flyfun" default is only a fallback for a native login that passed
+            # no scheme.
             scheme = request.session.pop("oauth_scheme", "flyfun")
             state = request.session.pop("oauth_state", "")
-            # Auth-code flow: hand back a short-TTL, single-use CODE bound to
-            # `state`, never the session JWT. The app POSTs it to /auth/exchange
-            # over HTTPS to get the token in a response body. Keeps the bearer
-            # token out of URLs/logs and closes the login-CSRF vector.
-            code = create_exchange_code(user.id, state, get_jwt_secret())
-            redirect_url = f"{scheme}://auth/callback?code={quote(code)}"
             if state:
-                redirect_url += f"&state={quote(state)}"
+                # New client — it signals code-flow capability by sending a
+                # `state`. Auth-code flow: hand back a short-TTL signed CODE
+                # bound to `state`, never the session JWT. The app POSTs it to
+                # /auth/exchange over HTTPS. Keeps the bearer token out of
+                # URLs/logs and closes the login-CSRF vector.
+                code = create_exchange_code(user.id, state, get_jwt_secret())
+                redirect_url = (
+                    f"{scheme}://auth/callback?code={quote(code)}&state={quote(state)}"
+                )
+            else:
+                # Legacy client (no `state`) — keep the old token param so
+                # not-yet-updated builds of consuming apps (this is shared
+                # multi-app code) still sign in. Migrated clients never hit this
+                # branch, so they never get a token in the URL. Remove once
+                # every consuming app sends `state`.
+                legacy_token = create_token(
+                    user.id, user.email, user.display_name, get_jwt_secret()
+                )
+                redirect_url = f"{scheme}://auth/callback?token={quote(legacy_token)}"
             return RedirectResponse(url=redirect_url, status_code=302)
 
         jwt_token = create_token(

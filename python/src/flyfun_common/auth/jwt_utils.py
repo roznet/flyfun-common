@@ -13,13 +13,20 @@ JWT_ALGORITHM = "HS256"
 _DEFAULT_EXPIRY_DAYS = 30
 _DEFAULT_REFRESH_THRESHOLD_DAYS = 15
 
-# Short-lived, single-use authorization code for the native "auth code"
-# deep-link flow (see designs/oauth-deeplink-hardening.md). The code is a
-# signed JWT — never the session token — carrying only the user id and the
-# client-generated ``state`` nonce, with a very short TTL. The app exchanges it
-# for the real session JWT over an HTTPS POST (``/auth/exchange``). Because it
-# is signed with JWT_SECRET a forged code can't be exchanged; because it is
-# bound to ``state`` an injected callback can't authenticate the victim.
+# Short-lived, signed authorization code for the native "auth code" deep-link
+# flow (see designs/oauth-deeplink-hardening.md). The code is a signed JWT —
+# never the session token — carrying only the user id and the client-generated
+# ``state`` nonce, with a very short TTL. The app exchanges it for the real
+# session JWT over an HTTPS POST (``/auth/exchange``). Because it is signed with
+# JWT_SECRET a forged code can't be exchanged; because it is bound to ``state``
+# an injected callback can't authenticate the victim.
+#
+# NOTE: this is a *stateless* code, deliberately NOT single-use — there is no
+# server-side used-code store. The short TTL bounds the replay window rather
+# than eliminating it: a code+state callback URL that leaks (e.g. proxy/302
+# logs) within the TTL can be replayed to mint the user's session. Accepted
+# residual — the callback is captured privately by ASWebAuthenticationSession
+# (not broadcast to other apps) and the window is short.
 EXCHANGE_CODE_TTL_SECONDS = 60
 _EXCHANGE_CODE_PURPOSE = "oauth_exchange"
 
