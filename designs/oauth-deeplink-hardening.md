@@ -1,9 +1,39 @@
-# OAuth deep-link hardening (H8) — design for review
+# OAuth deep-link hardening (H8)
 
-Status: **proposed, not implemented**. Addresses SECURITY_AUDIT.md **H8**
-("iOS JWT in custom-scheme query + loose regex"). Cross-repo: `flyfun-common`
-(Python auth router + Swift auth client) and each native app. Related:
-[ios-auth.md](ios-auth.md), [auth.md](auth.md).
+Status: **implemented (v1-direct)**, 2026-07-02. Addresses SECURITY_AUDIT.md
+**H8** ("iOS JWT in custom-scheme query + loose regex"). Cross-repo:
+`flyfun-common` (Python auth router + Swift auth client) and each native app.
+Related: [ios-auth.md](ios-auth.md), [auth.md](auth.md).
+
+## What shipped (deviations from the original design below)
+
+Two simplifications were chosen because the weather app's **first** App Store
+release has no installed user base to migrate:
+
+1. **v1-direct, no dual-emit.** The 3-phase backward-compatible migration
+   (§Migration) was skipped. The iOS callback emits **only** `code`+`state`
+   (never `token`) from day one. Existing beta testers simply re-authenticate on
+   the new build (accepted trade-off). Already-signed-in / rolling-token users
+   are unaffected regardless.
+2. **Stateless signed code, no DB store.** The one-time code is a 60-second
+   JWT (`purpose:"oauth_exchange"`, `uid`, `state`) signed with `JWT_SECRET`
+   (`jwt_utils.create_exchange_code` / `decode_exchange_code`), not a row in a
+   single-use store. The `state` binding is what actually closes login-CSRF; the
+   60 s TTL plus the private `ASWebAuthenticationSession` channel make replay a
+   non-issue. No migration required.
+
+Code map: server — `auth/router.py` (`/auth/login` state+scheme allowlist,
+callback mints code, new `POST /auth/exchange`), `auth/config.py`
+(`get_allowed_callback_schemes`), `auth/jwt_utils.py` (exchange-code helpers).
+Client — `AuthCallbackParser.codeAndState`, `FlyFunAuthService.signIn`
+(generate state → exchange). App — `AppState.handleAuthCallback` review
+carve-out (`unverifiedScope`); reviewer token minted with `scope:"review"`.
+
+The original design (below) is retained for context.
+
+---
+
+# OAuth deep-link hardening (H8) — original design
 
 ## Problem
 

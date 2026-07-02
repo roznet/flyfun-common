@@ -17,6 +17,20 @@ _DEV_JWT_SECRET = "dev-insecure-jwt-secret-do-not-use-in-production"
 # Providers that can be registered
 SUPPORTED_PROVIDERS = ("google", "apple", "email")
 
+# Exact custom URL schemes allowed as OAuth callback targets for native apps.
+# Replaces the old loose ``flyfun[a-z0-9-]*`` regex: a second app registering a
+# ``flyfun*`` scheme must not be able to receive the callback. Override in
+# deployment via OAUTH_ALLOWED_SCHEMES (comma-separated) as new apps ship.
+_DEFAULT_ALLOWED_SCHEMES = frozenset({"flyfunweather", "flyfunforms"})
+
+
+def get_allowed_callback_schemes() -> frozenset[str]:
+    """Exact-match allowlist of native callback URL schemes."""
+    raw = os.environ.get("OAUTH_ALLOWED_SCHEMES", "")
+    if raw.strip():
+        return frozenset(s.strip() for s in raw.split(",") if s.strip())
+    return _DEFAULT_ALLOWED_SCHEMES
+
 
 # Recognized environment names. Anything outside these sets is rejected so a
 # typo ("prod", "Production", "staging", …) can never SILENTLY fall through to

@@ -1,6 +1,7 @@
 import AuthenticationServices
 import Foundation
 import OSLog
+import Security
 
 #if canImport(UIKit)
 import UIKit
@@ -45,12 +46,20 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
     // MARK: - OAuth (Google, etc. via ASWebAuthenticationSession)
 
     /// Opens the OAuth flow for `provider` and returns the JWT token.
+    ///
+    /// Uses the native "authorization code" pattern: the server callback hands
+    /// back a short-TTL `code` bound to a client-generated `state` nonce (never
+    /// the token itself), which we verify and exchange for the session JWT over
+    /// an HTTPS POST. This keeps the bearer token out of URLs and closes the
+    /// login-CSRF vector an injected callback would otherwise open.
     public func signIn(provider: String = "google") async throws -> String {
+        let state = Self.generateState()
         let loginURL = config.baseURL.appendingPathComponent("auth/login/\(provider)")
         var components = URLComponents(url: loginURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "platform", value: "ios"),
             URLQueryItem(name: "scheme", value: config.callbackScheme),
+            URLQueryItem(name: "state", value: state),
         ]
 
         guard let url = components.url else { throw URLError(.badURL) }
@@ -83,11 +92,55 @@ public final class FlyFunAuthService: NSObject, ASWebAuthenticationPresentationC
         }
 
         let parser = AuthCallbackParser(customScheme: config.callbackScheme)
-        guard let token = parser.token(from: callbackURL) else {
-            logger.error("No token in callback URL: \(callbackURL)")
+        guard let (code, returnedState) = parser.codeAndState(from: callbackURL) else {
+            logger.error("No auth code in callback URL: \(callbackURL)")
             throw URLError(.userAuthenticationRequired)
         }
+        // Reject a callback whose state doesn't match the one we generated —
+        // an injected/forged callback can't satisfy this.
+        guard returnedState == state else {
+            logger.error("OAuth state mismatch — rejecting callback")
+            throw URLError(.userAuthenticationRequired)
+        }
+        return try await exchangeCode(code: code, state: state)
+    }
+
+    /// Trades a one-time auth code for the session JWT over HTTPS POST.
+    private func exchangeCode(code: String, state: String) async throws -> String {
+        let url = config.baseURL.appendingPathComponent("auth/exchange")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["code": code, "state": state]
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard http.statusCode == 200 else {
+            let detail = String(data: data, encoding: .utf8) ?? "Unknown error"
+            logger.error("Auth-code exchange failed (\(http.statusCode)): \(detail)")
+            throw URLError(.userAuthenticationRequired)
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = json["token"] as? String
+        else {
+            throw URLError(.cannotParseResponse)
+        }
         return token
+    }
+
+    /// A URL-safe random `state` nonce (matches the server's
+    /// `[A-Za-z0-9_-]{8,128}` validation).
+    private static func generateState() -> String {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     // MARK: - Apple Sign-In

@@ -20,11 +20,25 @@ public struct AuthCallbackParser: Sendable {
     }
 
     /// Returns the JWT if `url` is one of our recognized auth callbacks; nil otherwise.
+    ///
+    /// This is the legacy bare-token shape. Kept only for the App Store
+    /// reviewer deep link (a `scope:"review"` token) — the normal sign-in now
+    /// uses the code/state exchange below.
     public func token(from url: URL) -> String? {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return nil
-        }
+        queryValue(from: url, name: "token")
+    }
 
+    /// Returns `(code, state)` for the auth-code deep-link flow, or nil if the
+    /// URL isn't one of our recognized callbacks or carries no `code`. `state`
+    /// is optional (older callbacks may omit it) but is verified by the caller
+    /// against the value it generated before starting the flow.
+    public func codeAndState(from url: URL) -> (code: String, state: String?)? {
+        guard let code = queryValue(from: url, name: "code") else { return nil }
+        return (code, queryValue(from: url, name: "state"))
+    }
+
+    /// True if `url` matches our custom-scheme or universal-link callback shape.
+    private func isRecognizedCallback(_ components: URLComponents) -> Bool {
         let isCustomScheme = components.scheme == customScheme && components.host == "auth"
         let isUniversalLink: Bool = {
             guard let host = universalLinkHost else { return false }
@@ -32,13 +46,16 @@ public struct AuthCallbackParser: Sendable {
                 && components.host == host
                 && universalLinkPaths.contains(components.path)
         }()
+        return isCustomScheme || isUniversalLink
+    }
 
-        guard isCustomScheme || isUniversalLink else { return nil }
-
-        guard let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
-              !token.isEmpty
+    /// Extracts a non-empty query value from a recognized callback URL.
+    private func queryValue(from url: URL, name: String) -> String? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              isRecognizedCallback(components),
+              let value = components.queryItems?.first(where: { $0.name == name })?.value,
+              !value.isEmpty
         else { return nil }
-
-        return token
+        return value
     }
 }
