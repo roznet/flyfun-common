@@ -37,3 +37,17 @@ Key exports: `create_autorouter_router`, `get_autorouter_token`
 OAuth 2.1 authorization server for MCP connectors (claude.ai, Cowork). Dynamic client registration, PKCE, consent screen. Issues `api_tokens` tied to user accounts.
 Key exports: `create_oauth_router`, `OAuthClientRow`, `OAuthAuthorizationCodeRow`
 → Full doc: mcp-oauth.md
+
+## Client integration guides
+
+### ios-auth
+How native iOS apps integrate Google/Apple/magic-link sign-in via the shared
+`FlyFunCommon` Swift package (`FlyFunAuthService`, `KeychainBearerTokenStore`,
+`RollingBearerSession`) and the hardened authorization-code callback flow.
+→ Full doc: ios-auth.md
+
+### oauth-deeplink-hardening
+Rationale and migration for the H8 fix: native sign-in returns a short-TTL
+`code`+`state` (not the JWT) and exchanges it over HTTPS, closing token-in-URL and
+login-CSRF. Cross-repo (server router + Swift client + each app).
+→ Full doc: oauth-deeplink-hardening.md

@@ -1,307 +1,245 @@
 # iOS Authentication Guide
 
-> How to integrate Google and Apple Sign-In in flyfun iOS apps using the shared auth backend.
+> How to integrate Google, Apple, and magic-link sign-in in flyfun iOS apps using
+> the shared `FlyFunCommon` Swift package and auth backend.
+
+Related: [auth.md](./auth.md) (server auth module),
+[oauth-deeplink-hardening.md](oauth-deeplink-hardening.md) (the H8 hardening this
+guide reflects), [db.md](./db.md).
 
 ## Overview
 
-All flyfun iOS apps authenticate via the same server-side auth system (see [auth.md](./auth.md)). The flow is:
+All flyfun iOS apps authenticate against the same server-side auth system, and the
+**client side is now shared** — apps depend on the `FlyFunCommon` Swift package
+rather than hand-rolling their own auth service. The package provides everything:
+the OAuth/Apple/magic-link client, the callback parser, the Keychain store, and a
+rolling-Bearer `URLSession` wrapper.
 
-1. iOS app opens an in-app browser to the OAuth login endpoint
-2. User authenticates with Google or Apple
-3. Server issues a JWT and redirects to a custom URL scheme
-4. App captures the JWT, stores it in Keychain, and attaches it to all API requests
+The web sign-in (Google, or Apple via web) uses the native **authorization-code**
+pattern — the hardened H8 flow:
 
-The JWT is valid for 7 days. After expiry, the user simply signs in again (no refresh tokens).
+1. The client generates a random `state` nonce.
+2. It opens `ASWebAuthenticationSession` to `/auth/login/{provider}` with
+   `platform=ios`, the app's `scheme`, and the `state`.
+3. The user authenticates with the provider.
+4. The server callback redirects to `<scheme>://auth?code=<short-TTL-code>&state=<state>`
+   — a one-time signed code, **never the JWT**.
+5. The client verifies the returned `state` matches, then `POST`s the code to
+   `/auth/exchange` and receives the JWT in the **response body** (never a URL).
+6. The JWT is stored in the Keychain (device-bound) and attached to all API calls.
 
-> **Note on code sharing:** The auth boilerplate per app is small (~150 lines across 3 files). Each app currently implements its own copy. If shared auth logic grows significantly over time, consider extracting a `FlyfunAuth` Swift package in flyfun-common.
+The bearer JWT is valid for 7 days but **rolls automatically**: authenticated
+responses may carry an `X-Renewed-Token` header that `RollingBearerSession`
+persists, so active users effectively stay signed in. A 401 clears the token and
+returns the app to the login screen.
 
-## Server Endpoints (provided by flyfun-common)
+> **Why not a token in the callback URL?** The pre-H8 flow returned the JWT as
+> `<scheme>://auth?token=<jwt>` and accepted a bare token from any inbound deep
+> link. That leaked the credential into redirect logs and opened a login-CSRF /
+> session-fixation vector. See [oauth-deeplink-hardening.md](oauth-deeplink-hardening.md)
+> for the full rationale. **Do not read a `token=` param from a deep link** — the
+> only exception is the App Store reviewer carve-out below.
+
+## The shared package (`FlyFunCommon`)
+
+Add the Swift package `https://github.com/roznet/flyfun-common` as a dependency and
+link the `FlyFunCommon` product. Pin to a released tag (e.g. `exactVersion 0.6.3`).
+
+> **Transitive requirement:** the device-bound Keychain store needs
+> **rzutils ≥ 1.0.31** (the `accessible:` parameter on `CodableSecureStorage`).
+> Apps that pin rzutils by branch must ensure their resolved revision includes it,
+> or the package fails to compile with `extra argument 'accessible' in call`.
+
+Key types:
+
+| Type | Purpose |
+|------|---------|
+| `FlyFunAuthService` | The auth client. Configured with `Config(baseURL:callbackScheme:)`. Methods: `signIn(provider:)`, `exchangeAppleCredential(_:)`, `requestMagicLinkCode(email:)` / `consumeMagicLinkCode(email:code:)`, `deleteAccount(jwt:)`. |
+| `KeychainBearerTokenStore` | `BearerTokenStore` backed by the Keychain, partitioned by `service:` (use the bundle id). Bound to this device (`ThisDeviceOnly`) — a session JWT never migrates via backup or iCloud Keychain. |
+| `RollingBearerSession` | `URLSession` wrapper that injects `Authorization: Bearer`, persists `X-Renewed-Token`, and on 401 clears the store and fires `onUnauthorized`. Use it for every authenticated request. |
+| `AuthCallbackParser` | Used internally by `signIn` (`codeAndState`). Its legacy `token(from:)` reader exists **only** for the reviewer carve-out. |
+
+## Server Endpoints (provided by `create_auth_router`)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/auth/providers` | GET | List enabled providers (`["google", "apple"]`) |
-| `/auth/login/{provider}?platform=ios` | GET | Start OAuth flow; `platform=ios` makes callback redirect to custom URL scheme |
-| `/auth/callback/{provider}` | GET/POST | OAuth callback (server-side, not called by app directly) |
-| `/auth/apple/token` | POST | Native Apple Sign-In: exchange identity token for JWT |
-| `/auth/me` | GET | Returns current user info (verify token works) |
-| `/auth/logout` | POST | Invalidate session |
+| `/auth/providers` | GET | List enabled providers (`["google", "apple"]`, plus `email` when magic-link is wired) |
+| `/auth/login/{provider}` | GET | Start web OAuth. Params: `platform=ios`, `scheme=<app-scheme>`, `state=<nonce>`. Rejects a `scheme` not on the exact allowlist (400). |
+| `/auth/callback/{provider}` | GET/POST | Provider redirect target (server-side; the app never calls it). Emits `<scheme>://auth?code=…&state=…`. |
+| `/auth/exchange` | POST | Trade `{code, state}` for `{token, ...}` over HTTPS. The client half of the code flow. |
+| `/auth/apple/token` | POST | Native Apple Sign-In: exchange an identity token for a JWT. |
+| `/auth/me` | GET | Current user info (verify the token works). |
+| `/auth/logout` | POST | Invalidate this session. |
+| `/auth/logout-all` | POST | Invalidate all of the user's sessions. |
+| `/auth/account` | DELETE | Permanently delete the authenticated user (204). |
+| `/auth/magic-link/request` · `/auth/magic-link/consume-code` | POST | Email OTP sign-in (only when the server wires a `send_magic_link_email` callback). |
 
-## Implementation Steps
+## Per-app URL scheme (NOT a shared scheme)
 
-### 1. Register Custom URL Scheme
+Each app registers its **own** custom scheme, and the server enforces an exact
+allowlist so a second app registering a `flyfun*` scheme can't intercept the
+callback. The allowlist defaults to `{flyfunweather, flyfunforms}` and is
+overridable via the `OAUTH_ALLOWED_SCHEMES` env var.
 
-In `Info.plist`, register a URL scheme for the OAuth callback redirect:
+| App | Scheme |
+|-----|--------|
+| flyfun-weather | `flyfunweather` |
+| flyfun-forms | `flyfunforms` |
+| new app | `flyfun<app>` — **add it to the server allowlist** before shipping |
 
-```xml
-<key>CFBundleURLTypes</key>
-<array>
-    <dict>
-        <key>CFBundleURLName</key>
-        <string>net.ro-z.flyfun-forms</string>
-        <key>CFBundleURLSchemes</key>
-        <array>
-            <string>flyfun</string>
-        </array>
-    </dict>
-</array>
-```
+Register the scheme in `Info.plist` under `CFBundleURLTypes` → `CFBundleURLSchemes`.
+(`ASWebAuthenticationSession(callback: .customScheme(...))` captures the callback
+internally and does not strictly require the registration, but registering it is
+conventional and harmless.)
 
-The server redirects to `{scheme}://auth/callback?token=JWT_TOKEN` after successful login.
+## Implementation
 
-**URL scheme:** All flyfun apps use the shared `flyfun://` scheme. The server redirects to `flyfun://auth/callback?token=JWT` after successful login.
-
-| App | Scheme | Callback |
-|-----|--------|----------|
-| flyfun-weather | `weatherbrief` (legacy) | `weatherbrief://auth/callback?token=...` |
-| flyfun-forms | `flyfun` | `flyfun://auth/callback?token=...` |
-| future apps | `flyfun` | `flyfun://auth/callback?token=...` |
-
-New apps should use `flyfun` as their URL scheme. The weather app still uses `weatherbrief` for historical reasons and may be migrated later.
-
-### 2. AuthService (OAuth via ASWebAuthenticationSession)
-
-This handles both Google and Apple web-based OAuth:
+### 1. Configure the auth service
 
 ```swift
-import AuthenticationServices
-import Foundation
-import OSLog
+import FlyFunCommon
 
-@MainActor
-final class AuthService: NSObject, ASWebAuthenticationPresentationContextProviding {
-    private static let logger = Logger(subsystem: "your.bundle.id", category: "Auth")
-    private var authSession: ASWebAuthenticationSession?
-
-    nonisolated func presentationAnchor(
-        for session: ASWebAuthenticationSession
-    ) -> ASPresentationAnchor {
-        MainActor.assumeIsolated {
-            #if os(iOS)
-            let scene = UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }.first
-            return scene?.keyWindow ?? ASPresentationAnchor()
-            #else
-            return NSApplication.shared.keyWindow ?? ASPresentationAnchor()
-            #endif
-        }
-    }
-
-    /// Opens OAuth flow for the given provider and returns the JWT.
-    func signIn(baseURL: URL, provider: String = "google") async throws -> String {
-        let loginURL = baseURL.appendingPathComponent("auth/login/\(provider)")
-        var components = URLComponents(url: loginURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "platform", value: "ios")]
-
-        guard let url = components.url else { throw URLError(.badURL) }
-
-        let callbackURL = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<URL, Error>) in
-            let session = ASWebAuthenticationSession(
-                url: url,
-                callback: .customScheme("flyfun")
-            ) { url, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else if let url {
-                    continuation.resume(returning: url)
-                } else {
-                    continuation.resume(throwing: URLError(.cancelled))
-                }
-            }
-            session.presentationContextProvider = self
-            session.prefersEphemeralWebBrowserSession = false
-            self.authSession = session
-            session.start()
-        }
-
-        guard let token = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-            .queryItems?.first(where: { $0.name == "token" })?.value,
-              !token.isEmpty
-        else {
-            throw URLError(.userAuthenticationRequired)
-        }
-        return token
-    }
-}
+let authService = FlyFunAuthService(config: .init(
+    baseURL: APIConfig.baseURL,
+    callbackScheme: "flyfunforms"   // this app's scheme
+))
 ```
 
-### 3. AppState (JWT Storage + Auth State)
-
-Store the JWT in Keychain using `CodableSecureStorage` from rzutils:
+### 2. Auth state (Keychain + rolling session)
 
 ```swift
+import FlyFunCommon
 import Foundation
-import RZUtilsSwift
 
 @Observable @MainActor
 final class AppState {
-    @ObservationIgnored
-    private var secureStorage = CodableSecureStorage<String, String>(
-        key: "jwt", service: "your.bundle.id"
-    )
-
+    @ObservationIgnored let tokenStore: KeychainBearerTokenStore
+    @ObservationIgnored private(set) var rollingSession: RollingBearerSession!
     private(set) var jwt: String?
     var isAuthenticated: Bool { jwt != nil }
 
     init() {
-        jwt = secureStorage.wrappedValue
+        let store = KeychainBearerTokenStore(service: "net.ro-z.flyfun-forms")
+        self.tokenStore = store
+        self.jwt = store.token
+        self.rollingSession = RollingBearerSession(
+            store: store,
+            onUnauthorized: { [weak self] in await self?.handleUnauthorized() }
+        )
     }
 
-    func handleAuthCallback(url: URL) {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.host == "auth",
-              let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
-              !token.isEmpty
-        else { return }
-        secureStorage.wrappedValue = token
-        jwt = token
-    }
-
-    func logout() {
-        secureStorage.wrappedValue = nil
-        jwt = nil
-    }
+    func signIn(token: String) { tokenStore.token = token; jwt = token }
+    func logout() { tokenStore.token = nil; jwt = nil }
+    func handleUnauthorized() { jwt = nil }   // rolling session already cleared the store
 }
 ```
 
-### 4. Authenticated API Requests
+> **No `handleAuthCallback` / no `onOpenURL` for sign-in.** The web flow is captured
+> inside `ASWebAuthenticationSession` and never reaches `onOpenURL`. Do not add a
+> bare-token deep-link handler (see the reviewer carve-out for the one exception).
 
-Attach the JWT as a Bearer token on all API requests:
+### 3. Login view
 
-```swift
-var request = URLRequest(url: url)
-request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization")
-```
-
-Handle 401 responses by prompting re-login (token expired).
-
-### 5. Login View
-
-Show sign-in buttons for each provider:
+`signIn(provider:)` runs the whole code/state exchange and returns the JWT:
 
 ```swift
 struct LoginView: View {
     @Environment(AppState.self) private var appState
-    @State private var isSigningIn = false
-    @State private var errorMessage: String?
-    private let authService = AuthService()
-
-    var body: some View {
-        VStack(spacing: 24) {
-            // App branding...
-
-            Button("Sign in with Google") {
-                Task { await signIn(provider: "google") }
-            }
-
-            // Apple Sign-In button (optional, see below)
-        }
+    private var authService: FlyFunAuthService {
+        FlyFunAuthService(config: .init(baseURL: APIConfig.baseURL, callbackScheme: "flyfunforms"))
     }
 
+    // Google (web OAuth)
     private func signIn(provider: String) async {
-        isSigningIn = true
-        defer { isSigningIn = false }
         do {
-            let token = try await authService.signIn(
-                baseURL: APIConfig.baseURL, provider: provider
-            )
-            let url = URL(string: "flyfun://auth/callback?token=\(token)")!
-            appState.handleAuthCallback(url: url)
-        } catch {
-            if (error as? ASWebAuthenticationSessionError)?.code != .canceledLogin {
-                errorMessage = error.localizedDescription
-            }
-        }
+            let token = try await authService.signIn(provider: provider)
+            appState.signIn(token: token)
+        } catch { /* ignore ASWebAuthenticationSessionError.canceledLogin */ }
+    }
+
+    // Apple (native)
+    private func handleAppleSignIn(_ result: Result<ASAuthorization, Error>) async {
+        guard let cred = try? result.get().credential as? ASAuthorizationAppleIDCredential else { return }
+        let token = try? await authService.exchangeAppleCredential(cred)
+        if let token { appState.signIn(token: token) }
     }
 }
 ```
 
-### 6. App Entry Point
+### 4. Authenticated requests
 
-Wire up the `onOpenURL` handler and gate content on auth state:
+Route every authenticated call through the rolling session — never build the
+`Authorization` header by hand, so token renewal and 401 handling stay centralized:
+
+```swift
+let (data, http) = try await appState.rollingSession.data(for: request)
+```
+
+### 5. App entry point
 
 ```swift
 @main
 struct MyApp: App {
     @State private var appState = AppState()
-
     var body: some Scene {
         WindowGroup {
-            if appState.isAuthenticated {
-                ContentView()
-            } else {
-                LoginView()
-            }
+            if appState.isAuthenticated { ContentView() } else { LoginView() }
         }
         .environment(appState)
-        .onOpenURL { url in
-            appState.handleAuthCallback(url: url)
-        }
+        // No .onOpenURL for auth. Add one only for a reviewer carve-out (below).
     }
 }
 ```
 
 ## Apple Sign-In
 
-Two approaches:
+Prefer the **native** button (`SignInWithAppleButton`) with
+`exchangeAppleCredential(_:)` — it's the standard for flyfun apps and avoids a web
+round-trip. Web-based Apple sign-in still works via `signIn(provider: "apple")` if
+you need it. Native Apple Sign-In requires the `Sign in with Apple` capability and
+the `APPLE_*` server env vars below.
 
-### Option A: Web OAuth (simpler, same as Google)
+## App Store reviewer carve-out (optional, per app)
 
-Use the same `ASWebAuthenticationSession` flow with `provider: "apple"`:
-```swift
-authService.signIn(baseURL: baseURL, provider: "apple")
-```
+Apple reviewers need a one-tap way in. Two options:
 
-The server handles the Apple OAuth flow identically to Google. This requires the Apple Service ID and private key configured on the server (see server env vars below).
-
-### Option B: Native ASAuthorizationAppleIDProvider (polished UX)
-
-Uses the native iOS Apple Sign-In button and sends the identity token directly to the server:
-
-```swift
-import AuthenticationServices
-
-func handleAppleSignIn() {
-    let request = ASAuthorizationAppleIDProvider().createRequest()
-    request.requestedScopes = [.fullName, .email]
-    // Present via ASAuthorizationController...
-    // On success, POST identity token to /auth/apple/token
-}
-```
-
-The server endpoint `POST /auth/apple/token` accepts:
-```json
-{
-    "identity_token": "eyJhbGc...",
-    "first_name": "Jane",
-    "last_name": "Doe"
-}
-```
-and returns `{"token": "jwt...", "user_id": "uuid"}`.
-
-**Recommendation:** Start with Option A. Upgrade to Option B later for a more polished experience.
+1. **A real demo account through the normal flow** (what flyfun-forms does). No
+   special code — the reviewer signs in with a dedicated Apple/Google test account.
+   Simplest; keeps the bare-token path fully removed.
+2. **A reviewer deep link** (what flyfun-weather does). Keep a bare-token
+   `onOpenURL` handler that accepts a token **only** when the app is signed out
+   **and** the (unverified) JWT carries a `scope:"review"` claim. The claim is a
+   routing hint only — the server verifies the signature on every call, so a forged
+   review token 401s. Mint the reviewer token with `scripts/mint_reviewer_token.py`
+   (in the weather repo), signed with the production `JWT_SECRET`, against a
+   dedicated throwaway review account. See the carve-out rationale in
+   [oauth-deeplink-hardening.md](oauth-deeplink-hardening.md).
 
 ## Server Environment Variables
 
-For Google OAuth (already configured):
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+Google OAuth: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`.
 
-For Apple Sign-In (needed for both options):
-- `APPLE_CLIENT_ID` — Service ID from Apple Developer Console
-- `APPLE_TEAM_ID` — your Apple Developer Team ID
-- `APPLE_KEY_ID` — private key ID
-- `APPLE_PRIVATE_KEY` — PEM-formatted ES256 private key
-- `APPLE_APP_IDS` — comma-separated bundle IDs for native token validation (Option B only)
+Apple Sign-In: `APPLE_CLIENT_ID` (Service ID), `APPLE_TEAM_ID`, `APPLE_KEY_ID`,
+`APPLE_PRIVATE_KEY` (PEM ES256), `APPLE_APP_IDS` (comma-separated bundle ids, for
+native token validation).
+
+OAuth callback: `OAUTH_ALLOWED_SCHEMES` (comma-separated allowlist; defaults to
+`flyfunweather,flyfunforms`). `JWT_SECRET` signs both session tokens and the
+short-TTL exchange codes.
 
 ## Xcode Setup Checklist
 
-- [ ] Register custom URL scheme in `Info.plist`
-- [ ] Add `Sign in with Apple` capability (if using native Apple Sign-In)
-- [ ] Import `RZUtilsSwift` for `CodableSecureStorage`
-- [ ] Ensure `App Transport Security` allows your API domain (HTTPS is fine by default)
+- [ ] Add the `flyfun-common` Swift package; link `FlyFunCommon`. Ensure resolved
+      rzutils ≥ 1.0.31.
+- [ ] Register the app's own custom URL scheme in `Info.plist`, and add it to the
+      server's `OAUTH_ALLOWED_SCHEMES` allowlist.
+- [ ] Add the `Sign in with Apple` capability (for native Apple Sign-In).
+- [ ] Ensure App Transport Security allows the API domain (HTTPS is fine by default).
 
 ## References
 
-- Server auth module: [auth.md](./auth.md)
-- Database schema: [db.md](./db.md)
-- Reference implementation: flyfun-weather iOS app (`Services/AuthService.swift`, `App/AppState.swift`)
+- Hardening rationale / migration: [oauth-deeplink-hardening.md](oauth-deeplink-hardening.md)
+- Server auth module: [auth.md](./auth.md) · Database schema: [db.md](./db.md)
+- Reference apps: **flyfun-weather** (`App/AppState.swift` — includes the reviewer
+  carve-out) and **flyfun-forms** (`Services/AppState.swift`, `Views/LoginView.swift`
+  — no carve-out, bare-token path removed).
