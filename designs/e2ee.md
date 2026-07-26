@@ -63,6 +63,52 @@ plainly in `PRIVACY.md`: the encryption defends absolutely against **breach and
 compulsion**, and only partially against **us**. A native or desktop airport
 client with pinned code closes the remaining gap; a browser cannot.
 
+## Claims we can defend
+
+Security claims are a liability if they outrun the design. A claim that "we
+cannot read it" is a **regulatory misstatement**, not merely an embarrassment,
+if a bug means we could have. Public copy must derive from the table above, so
+it is fixed here rather than left to marketing.
+
+**Say this:**
+
+> We cannot read your passengers' identity data. Neither can anyone who steals
+> our database. Only you and the airport you filed with hold the keys, and the
+> data is destroyed 30 days after the flight.
+
+Every clause is mechanically true and independently checkable. Supporting
+specifics, in descending order of how much they convince a technical reader:
+
+- The server never imports the decryption function — **enforced by an import
+  lint in CI**, not by policy.
+- Identity fields are shredded on a timer; the ciphertext is inert thereafter
+  even in backups.
+- The threat model, including its failure rows, is published.
+- The crypto layer is open source and independently auditable.
+
+**Never say:** "military-grade encryption" (meaningless, and it marks us as
+unserious to exactly the reader we need), "unhackable", "100% secure",
+"zero-knowledge" (a specific cryptographic property we do not implement), or
+"Signal-level" (invites the browser-console comparison we lose). Never imply
+metadata is protected.
+
+Claims should be **versioned and dated**, tied to a specific release, and
+accompanied by the limitations. Publishing what we do *not* protect is what
+makes the rest credible.
+
+### On AI-assisted attack
+
+Worth stating internally because it is easy to reason about badly: LLMs do not
+threaten AES-256 or X25519. Cryptography is not the weak point and never was.
+What has genuinely changed is **phishing quality** and **automated discovery of
+unpatched exposed systems** — which is the status quo's weak point, not ours.
+
+The consequence for this design is not stronger algorithms. It is that the
+**officer's device and session become the target**, since that is where
+plaintext exists. Hence phishing-resistant auth (passkeys) for the console, short
+retention, per-org key scoping so one compromised airport cannot read another's
+submissions, and a bias toward a native client where integrity actually matters.
+
 ## Primitives
 
 No novel constructions. All from `cryptography` (Python) / CryptoKit + Secure
@@ -79,6 +125,19 @@ Enclave (Swift).
 Rejected: RSA (key size, footguns), NaCl sealed boxes (workable, but HPKE gives
 proper AAD binding and a spec both platforms can point at), AES-KW (no
 public-key wrapping).
+
+### Post-quantum readiness
+
+Passport numbers, dates and places of birth have a decade-plus shelf life, so
+*harvest-now-decrypt-later* against X25519 is a real consideration here in a way
+it is not for ephemeral messaging. Not urgent, and adopting a hybrid KEM today
+would trade a live compatibility risk for a speculative one — but the wire format
+carries `v` and per-group `alg` precisely so a hybrid X25519+ML-KEM HPKE suite
+can be introduced later without invalidating existing records. Old generations
+stay decryptable under their original suite.
+
+This is also a cheap, honest credibility point with a security-minded reviewer:
+the format anticipates the migration rather than claiming immunity.
 
 ## Key hierarchy
 
