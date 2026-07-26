@@ -38,6 +38,11 @@ OAuth 2.1 authorization server for MCP connectors (claude.ai, Cowork). Dynamic c
 Key exports: `create_oauth_router`, `OAuthClientRow`, `OAuthAuthorizationCodeRow`
 → Full doc: mcp-oauth.md
 
+### e2ee
+**Proposal.** End-to-end encryption primitives for pilot→airport submissions: HPKE envelope encryption with per-field-group DEKs, org/device key hierarchy, offline root of trust for airport key bundles, blind indexing, and crypto-shredding. Explicit threat model — protects against breach and compulsion, not against a backdoored web console.
+Key concepts: `seal_groups`, `open_group`, `KeyBundle`, `verify_submission`, `blind_index`
+→ Full doc: e2ee.md
+
 ## Client integration guides
 
 ### ios-auth
