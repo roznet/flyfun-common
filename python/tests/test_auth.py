@@ -198,3 +198,78 @@ def test_delete_account(tmp_path):
     finally:
         session.close()
         reset_engine()
+
+
+def test_delete_account_sweeps_oauth_grants(tmp_path):
+    """DELETE /auth/account revokes the user's OAuth grants.
+
+    The OAuth tables key on user_id with no FK, so nothing cascades when the
+    user row goes. A surviving refresh token would stay usable: the refresh
+    grant validates hash/revoked/expiry/client but never that the user still
+    exists, so it would keep minting access tokens for a deleted account.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    os.environ["ENVIRONMENT"] = "development"
+    os.environ["DATA_DIR"] = str(tmp_path)
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from starlette.middleware.sessions import SessionMiddleware
+
+    from flyfun_common.auth.router import create_auth_router
+    from flyfun_common.db.engine import (
+        SessionLocal, ensure_dev_user, get_engine, init_shared_db, reset_engine,
+    )
+    from flyfun_common.oauth.models import (
+        OAuthAuthorizationCodeRow, OAuthRefreshTokenRow,
+    )
+
+    reset_engine()
+    get_engine()
+    init_shared_db()
+
+    session = SessionLocal()
+    try:
+        ensure_dev_user(session)
+
+        expires = datetime.now(timezone.utc) + timedelta(days=90)
+        session.add(OAuthRefreshTokenRow(
+            token_hash="refresh-hash-dev", client_id="client-1",
+            user_id="dev-user-001", access_token_hash="access-hash-dev",
+            expires_at=expires,
+        ))
+        session.add(OAuthAuthorizationCodeRow(
+            code="code-dev", client_id="client-1", user_id="dev-user-001",
+            redirect_uri="https://example.test/cb", code_challenge="chal",
+            expires_at=expires,
+        ))
+        # A second user's grants must survive — the sweep is scoped to the
+        # authenticated caller, not a blanket delete.
+        session.add(OAuthRefreshTokenRow(
+            token_hash="refresh-hash-other", client_id="client-1",
+            user_id="other-user", access_token_hash="access-hash-other",
+            expires_at=expires,
+        ))
+        session.commit()
+
+        app = FastAPI()
+        app.add_middleware(SessionMiddleware, secret_key="test")
+        app.include_router(create_auth_router())
+
+        client = TestClient(app)
+        assert client.delete("/auth/account").status_code == 204
+
+        session.expire_all()
+        assert session.query(OAuthRefreshTokenRow).filter_by(
+            user_id="dev-user-001"
+        ).count() == 0
+        assert session.query(OAuthAuthorizationCodeRow).filter_by(
+            user_id="dev-user-001"
+        ).count() == 0
+        assert session.query(OAuthRefreshTokenRow).filter_by(
+            user_id="other-user"
+        ).count() == 1
+    finally:
+        session.close()
+        reset_engine()
