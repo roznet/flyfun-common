@@ -43,6 +43,12 @@ from flyfun_common.auth.jwt_utils import (
 )
 from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
+# Imported from the models module rather than the ``oauth`` package: the
+# package __init__ pulls in oauth.router, which would import back into auth.
+from flyfun_common.oauth.models import (
+    OAuthAuthorizationCodeRow,
+    OAuthRefreshTokenRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +557,19 @@ def create_auth_router(
         # audit/reporting — CostLedgerRow has no FK cascade on users)
         db.query(UserPreferencesRow).filter(UserPreferencesRow.user_id == user_id).delete()
         db.query(ApiTokenRow).filter(ApiTokenRow.user_id == user_id).delete()
+        # OAuth grants are keyed on user_id with no FK (added in weatherbrief
+        # migration 041), so nothing cascades when the user row goes. Without
+        # these, a deleted user's refresh token stays valid: the refresh grant
+        # checks hash/revoked/expiry/client but never that the user still
+        # exists, so it would keep minting access tokens for a dead account.
+        # Deleting the authorization codes too — they are short-lived and
+        # carry no retention value.
+        db.query(OAuthRefreshTokenRow).filter(
+            OAuthRefreshTokenRow.user_id == user_id
+        ).delete()
+        db.query(OAuthAuthorizationCodeRow).filter(
+            OAuthAuthorizationCodeRow.user_id == user_id
+        ).delete()
         db.query(UserRow).filter(UserRow.id == user_id).delete()
 
         logger.info("Account deleted for user %s", user_id)
