@@ -121,6 +121,8 @@ public struct ZonedWallClock: Hashable, Sendable {
     /// transition) is resolved by `Calendar` to the instant the transition
     /// lands on. If it cannot be resolved at all the instant is left unchanged,
     /// so an edit is dropped rather than silently jumping somewhere arbitrary.
+    /// A wall-clock that exists twice (fall-back) keeps the occurrence being
+    /// displayed; see ``preservingRepeatedHourOffset(_:)``.
     private func rebuilding(
         year: Int? = nil, month: Int? = nil, day: Int? = nil,
         hour: Int? = nil, minute: Int? = nil
@@ -133,7 +135,24 @@ public struct ZonedWallClock: Hashable, Sendable {
         if let minute { components.minute = minute }
         components.second = 0
         guard let rebuilt = calendar.date(from: components) else { return self }
-        return ZonedWallClock(instant: rebuilt, timeZoneId: timeZoneId)
+        return ZonedWallClock(instant: preservingRepeatedHourOffset(rebuilt), timeZoneId: timeZoneId)
+    }
+
+    /// On a fall-back night one wall-clock hour happens twice, and
+    /// `Calendar.date(from:)` always resolves it to the first occurrence. An
+    /// edit made while displaying the *second* occurrence (setting the minute
+    /// of 02:30 GMT+1 on the night Paris leaves summer time) would then jump an
+    /// hour earlier. When the same wall-clock also exists at the original
+    /// instant's UTC offset, keep that occurrence. Any other offset change (a
+    /// date edit across a DST boundary, a spring-forward gap) is left to
+    /// `Calendar`.
+    private func preservingRepeatedHourOffset(_ rebuilt: Date) -> Date {
+        let zone = timeZone
+        let originalOffset = zone.secondsFromGMT(for: instant)
+        let rebuiltOffset = zone.secondsFromGMT(for: rebuilt)
+        guard rebuiltOffset != originalOffset else { return rebuilt }
+        let sameWallClock = rebuilt.addingTimeInterval(TimeInterval(rebuiltOffset - originalOffset))
+        return zone.secondsFromGMT(for: sameWallClock) == originalOffset ? sameWallClock : rebuilt
     }
 
     // MARK: - Minute options

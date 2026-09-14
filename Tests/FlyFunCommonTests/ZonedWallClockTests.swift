@@ -157,6 +157,27 @@ struct ZonedWallClockInstantTests {
         #expect(clock.minuteOption(step: 15) == 30)
         #expect(clock.minuteOption(step: 5) == 35)
     }
+
+    /// Paris leaves summer time on 25 October 2026: 02:00-03:00 happens twice,
+    /// first at GMT+2 (00:00-01:00Z) and again at GMT+1 (01:00-02:00Z).
+    @Test func editingTheSecondOccurrenceOfARepeatedHourStaysOnIt() {
+        let second = ZonedWallClock(instant: iso("2026-10-25T01:30:00Z"), timeZoneId: "Europe/Paris")
+        #expect(second.hour == 2)
+        #expect(second.settingMinute(45).instant == iso("2026-10-25T01:45:00Z"))
+        #expect(second.settingMinute(30).instant == second.instant)
+    }
+
+    @Test func editingTheFirstOccurrenceOfARepeatedHourStaysOnIt() {
+        let first = ZonedWallClock(instant: iso("2026-10-25T00:30:00Z"), timeZoneId: "Europe/Paris")
+        #expect(first.hour == 2)
+        #expect(first.settingMinute(45).instant == iso("2026-10-25T00:45:00Z"))
+    }
+
+    @Test func leavingTheRepeatedHourStillChangesTheOffset() {
+        // From the second 02:30 (GMT+1) to 01:30, which only exists at GMT+2.
+        let second = ZonedWallClock(instant: iso("2026-10-25T01:30:00Z"), timeZoneId: "Europe/Paris")
+        #expect(second.settingHour(1).instant == iso("2026-10-24T23:30:00Z"))
+    }
 }
 
 @Suite("ZonedWallClock timezone options")

@@ -32,6 +32,10 @@ GMT+1 with no special casing. A picker built on `TimeZone.secondsFromGMT()` with
 no date argument silently uses *today's* offset and puts every flight planned
 across a DST boundary an hour out.
 
+Inside the repeated hour of a fall-back night, an edit keeps the occurrence
+being displayed: `Calendar` alone would resolve 02:45 to the *first* 02:45
+and move a flight shown at the second one an hour earlier.
+
 ## Why not a wall-clock plus an offset
 
 The representation this replaces stored a calendar day and an `"HH:mm"` UTC
