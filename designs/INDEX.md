@@ -40,6 +40,13 @@ Key exports: `create_oauth_router`, `OAuthClientRow`, `OAuthAuthorizationCodeRow
 
 ## Client integration guides
 
+### datetime
+`ZonedWallClock`: a timezone-aware wall-clock over an absolute instant, used by the
+iOS apps' flight date/time pickers. Switching zone preserves the instant; edits are
+DST-correct for the displayed date and move the day when they cross midnight.
+Key exports: `ZonedWallClock`, `ZonedTimeZoneOption`
+→ Full doc: datetime.md
+
 ### ios-auth
 How native iOS apps integrate Google/Apple/magic-link sign-in via the shared
 `FlyFunCommon` Swift package (`FlyFunAuthService`, `KeychainBearerTokenStore`,
