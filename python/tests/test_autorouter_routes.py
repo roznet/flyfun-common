@@ -95,3 +95,20 @@ def test_upstream_shape_problems_are_distinguishable_from_unreachable():
     with pytest.raises(AutorouterUnavailable) as excinfo:
         parse_recent_routes({"count": 1})
     assert excinfo.value.detail == "autorouter_upstream_error"
+
+
+def test_status_answers_from_stored_credentials_without_calling_autorouter(monkeypatch):
+    """A client asks this on every screen offering Autorouter, so it must not
+    cost an upstream round trip."""
+    import httpx
+
+    from flyfun_common.autorouter import create_autorouter_routes_router
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("status must not call Autorouter")
+
+    monkeypatch.setattr(httpx, "get", _fail)
+
+    router = create_autorouter_routes_router(token_loader=lambda db, uid: "tok")
+    paths = {route.path for route in router.routes}
+    assert paths == {"/api/autorouter/status", "/api/autorouter/routes"}
