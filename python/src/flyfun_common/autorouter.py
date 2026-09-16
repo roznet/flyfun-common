@@ -241,6 +241,18 @@ class AutorouterRoutesResponse(BaseModel):
     routes: list[AutorouterRoute] = []
 
 
+class AutorouterLinkStatus(BaseModel):
+    """Whether this user has a usable Autorouter token.
+
+    Answered from stored credentials alone — no call to Autorouter — so a
+    client can ask on every screen that offers an Autorouter feature and
+    present it as unavailable-with-a-reason up front, rather than sending the
+    pilot into a picker that can only fail with a 409.
+    """
+
+    linked: bool
+
+
 class AutorouterNotLinked(Exception):
     """No usable Autorouter token for this user (never linked, or revoked)."""
 
@@ -446,13 +458,25 @@ def create_autorouter_routes_router(
     prefix: str = "/api/autorouter",
     token_loader: Callable[[Session, str], str | None] | None = None,
 ) -> APIRouter:
-    """Mountable ``GET {prefix}/routes`` for an "Import from Autorouter" picker.
+    """Mountable Autorouter read endpoints for an "Import from Autorouter" picker.
 
-    Answers 409 ``autorouter_not_linked`` when there is no usable token, which
-    is the client's cue to point the pilot at the account-linking page, and 502
-    when Autorouter itself is the problem.
+    ``GET {prefix}/routes`` answers 409 ``autorouter_not_linked`` when there is
+    no usable token, which is the client's cue to point the pilot at the
+    account-linking page, and 502 when Autorouter itself is the problem.
+
+    ``GET {prefix}/status`` answers the same question without fetching
+    anything, so a client can grey the feature with its reason before the pilot
+    taps it.
     """
     router = APIRouter(prefix=prefix, tags=["autorouter"])
+
+    @router.get("/status", response_model=AutorouterLinkStatus)
+    def link_status(
+        user_id: str = Depends(current_user_id),
+        db: Session = Depends(get_db),
+    ) -> AutorouterLinkStatus:
+        loader = token_loader or get_autorouter_token
+        return AutorouterLinkStatus(linked=bool(loader(db, user_id)))
 
     @router.get("/routes", response_model=AutorouterRoutesResponse)
     def list_routes(

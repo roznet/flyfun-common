@@ -68,6 +68,7 @@ This uses the existing `credentials.py` helpers (Fernet encryption at rest) — 
 | `GET` | `/autorouter/status` | Required | Check if user has linked account |
 | `POST` | `/autorouter/unlink` | Required | Remove stored Autorouter token |
 | `GET` | `/api/autorouter/routes` | Required | Recent routes for an "Import from Autorouter" picker |
+| `GET` | `/api/autorouter/status` | Required | Whether this user has a usable token, without calling Autorouter |
 
 ## Recent routes (`router/logs`)
 
@@ -91,13 +92,18 @@ from flyfun_common.autorouter import (
 | `parse_recent_routes(payload)` | Pure normalisation of a `router/logs` payload into `AutorouterRoute` rows. Unit-testable without a network. |
 | `list_recent_routes(token, limit)` | HTTP + normalise for a bearer token. |
 | `fetch_recent_routes(db, user_id, limit, token_loader=…)` | Adds the token glue; clears a token Autorouter rejects. |
-| `create_autorouter_routes_router(prefix=…, token_loader=…)` | Mountable `GET {prefix}/routes`. |
+| `create_autorouter_routes_router(prefix=…, token_loader=…)` | Mountable `GET {prefix}/routes` + `GET {prefix}/status`. |
 
 An `AutorouterRoute` carries what a picker row needs (`departure`, `destination`,
 `departure_time`, `route_distance_nm`, `aircraft_description`, `callsign`) plus the raw
 `fplan`. **Consumers parse the plan themselves** — `euro_aip.parse_icao_fpl` server-side,
 `RZFlight.ICAOFlightPlanParser` on iOS — so this module doesn't grow a parser it has no
 other use for.
+
+`{prefix}/status` answers `{"linked": bool}` from stored credentials alone, with no call
+to Autorouter, so a client can ask on every screen that offers an Autorouter feature and
+present it as unavailable-with-a-reason up front. Without it the only way to learn the
+account is unlinked is to open the picker and wait for a 409.
 
 `token_loader` is an injection point for an app with a richer token story: flyfun-weather
 passes its own loader, which falls back to exchanging dev username/password credentials
