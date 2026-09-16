@@ -67,6 +67,51 @@ This uses the existing `credentials.py` helpers (Fernet encryption at rest) — 
 | `GET` | `/auth/callback/autorouter` | Session | Handle Autorouter redirect, exchange code |
 | `GET` | `/autorouter/status` | Required | Check if user has linked account |
 | `POST` | `/autorouter/unlink` | Required | Remove stored Autorouter token |
+| `GET` | `/api/autorouter/routes` | Required | Recent routes for an "Import from Autorouter" picker |
+
+## Recent routes (`router/logs`)
+
+Several flyfun apps offer an "Import from Autorouter" picker: pick one of your recent
+routes and start a flight from its ICAO flight plan. The client for that lives here
+rather than in each app, because this module already owns the token.
+
+```python
+from flyfun_common.autorouter import (
+    AutorouterNotLinked,
+    AutorouterUnavailable,
+    create_autorouter_routes_router,
+    fetch_recent_routes,
+    list_recent_routes,
+    parse_recent_routes,
+)
+```
+
+| Function | Purpose |
+|----------|---------|
+| `parse_recent_routes(payload)` | Pure normalisation of a `router/logs` payload into `AutorouterRoute` rows. Unit-testable without a network. |
+| `list_recent_routes(token, limit)` | HTTP + normalise for a bearer token. |
+| `fetch_recent_routes(db, user_id, limit, token_loader=…)` | Adds the token glue; clears a token Autorouter rejects. |
+| `create_autorouter_routes_router(prefix=…, token_loader=…)` | Mountable `GET {prefix}/routes`. |
+
+An `AutorouterRoute` carries what a picker row needs (`departure`, `destination`,
+`departure_time`, `route_distance_nm`, `aircraft_description`, `callsign`) plus the raw
+`fplan`. **Consumers parse the plan themselves** — `euro_aip.parse_icao_fpl` server-side,
+`RZFlight.ICAOFlightPlanParser` on iOS — so this module doesn't grow a parser it has no
+other use for.
+
+`token_loader` is an injection point for an app with a richer token story: flyfun-weather
+passes its own loader, which falls back to exchanging dev username/password credentials
+for a token in dev mode.
+
+**Errors map to two statuses.** `AutorouterNotLinked` (never linked, or a 401 from
+Autorouter, which also clears the dead token) becomes `409 autorouter_not_linked`, the
+client's cue to send the pilot to the linking page. `AutorouterUnavailable` becomes
+`502 autorouter_unreachable`.
+
+**One link serves every app.** The flyfun apps share one database and one Fernet key, so
+a token linked on one app is readable from all of them. A consuming app mounts
+`create_autorouter_routes_router()` *without* mounting `create_autorouter_router()`, and
+so needs no redirect URI of its own registered with Autorouter.
 
 ## Usage
 
