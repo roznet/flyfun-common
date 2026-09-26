@@ -69,6 +69,23 @@ code's user matches. A victim's app fails that check; the attacker never sees
 the code, which is delivered to the victim's device. The cookie web flow
 doesn't need this: its user comes from the approving browser's own session.
 
+**Residual risk: a hijacked custom scheme.** The redeem check assumes the code
+reaches the app that belongs to the approving user. Inside
+`ASWebAuthenticationSession` that holds: the callback goes back to the app
+that started the session. But an attacker can send their ticket URL to a
+victim who opens it in a *plain* browser. The final redirect is then to
+`flyfunweather://…?code=` (attacker's uid, victim's token). Custom schemes
+aren't exclusive, on iOS and even less so on Android, so a malicious app
+claiming `flyfunweather` on the victim's device could receive that code and
+redeem it with the attacker's bearer. This needs a malicious app installed on
+the victim's device *and* the victim approving from a link. Accepted for now.
+Closing it means either:
+- returning through a verified https universal link, where
+  `ASWebAuthenticationSession`'s `.https` callback and the AASA file make
+  delivery exclusive; or
+- showing an interstitial naming the flyfun account before redirecting to
+  Autorouter on the ticket path.
+
 **Errors on the app path never render an HTTP error page.** The pilot is inside
 an in-app browser waiting for the custom-scheme callback, so every failure
 (declined consent, bad state, expired session, token-exchange failure, stale
