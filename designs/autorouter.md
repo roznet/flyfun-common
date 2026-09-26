@@ -23,18 +23,40 @@ The module is intentionally separate from `auth/` because it serves a different 
 ```
 User clicks "Connect Autorouter"
   ↓
-GET /autorouter/link (requires active flyfun session)
-  → stores CSRF state + user_id in session
+GET /autorouter/link (flyfun session cookie, optional ?next=/path)
+  — or, from a native app —
+POST /autorouter/link-ticket {scheme} (bearer) → {url: /autorouter/link?ticket=…}
+GET  /autorouter/link?ticket=… (opened in ASWebAuthenticationSession)
+  → stores CSRF state + user_id + return destination in session
   → redirects to https://www.autorouter.aero/authorize
   ↓
 User authorizes on Autorouter's site
   ↓
-GET /auth/callback/autorouter?code=...&state=...
+GET /auth/callback/autorouter?code=...&state=...   (or ?error=... if declined)
   → validates state (CSRF protection)
   → exchanges code for access token at Autorouter's token endpoint
   → stores token encrypted in UserPreferencesRow
-  → redirects to /settings?autorouter=linked
+  → redirects to the return destination:
+      app ticket  → {scheme}://autorouter/callback?status=linked
+      web ?next=  → that path + autorouter=linked
+      otherwise   → success_redirect (default /settings.html?autorouter=linked)
 ```
+
+**Why a ticket for native apps.** An app holds only a bearer JWT in its
+Keychain, and a browser navigation (even `ASWebAuthenticationSession`) cannot
+send an `Authorization` header — so `/autorouter/link` would 401 and the pilot
+would have to sign in to the website first. The ticket is a signed JWT
+(`purpose=autorouter_link`, 120 s) carrying the user id and the app's callback
+scheme, which must be in `OAUTH_ALLOWED_SCHEMES` both when issued and when
+used. It is not single-use: replay inside the window can only link an
+Autorouter account to the ticket's own user.
+
+**Errors on the app path never render an HTTP error page.** The pilot is inside
+an in-app browser waiting for the custom-scheme callback, so every failure
+(declined consent, bad state, expired session, token-exchange failure, stale
+ticket) redirects to `{scheme}://autorouter/callback?status=error&reason=…`
+(`denied`, `invalid_state`, `session_expired`, `no_code`, `exchange_failed`,
+`expired`). Web failures keep their HTTP status codes.
 
 ### Token Storage
 
@@ -63,7 +85,8 @@ This uses the existing `credentials.py` helpers (Fernet encryption at rest) — 
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `GET` | `/autorouter/link` | Required | Start OAuth flow → redirect to Autorouter |
+| `POST` | `/autorouter/link-ticket` | Required (bearer) | Native app: short-lived URL that starts linking |
+| `GET` | `/autorouter/link` | Cookie or `ticket` | Start OAuth flow → redirect to Autorouter |
 | `GET` | `/auth/callback/autorouter` | Session | Handle Autorouter redirect, exchange code |
 | `GET` | `/autorouter/status` | Required | Check if user has linked account |
 | `POST` | `/autorouter/unlink` | Required | Remove stored Autorouter token |
