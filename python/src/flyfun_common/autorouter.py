@@ -21,8 +21,18 @@ Linking can start from three places, and the callback returns to each:
   with ``autorouter=linked`` added;
 * a native app, which has only a bearer token that an in-app browser can't
   send: it POSTs ``/autorouter/link-ticket`` for a short-lived signed URL,
-  opens that in ``ASWebAuthenticationSession``, and is sent back to
-  ``{scheme}://autorouter/callback?status=linked|error``.
+  opens that in ``ASWebAuthenticationSession``, is sent back to
+  ``{scheme}://autorouter/callback?status=authorized&code=…`` (or
+  ``status=error&reason=…``), and redeems the code with its bearer token at
+  ``POST /autorouter/link-complete``.
+
+Why the app path doesn't store the token at the callback: the ticket URL is a
+bearer-less capability. If the callback stored the token for the ticket's user,
+an attacker could mint a ticket for their own account, get a victim to approve
+on autorouter.aero, and end up holding the victim's Autorouter token (an
+account-linking CSRF). Instead the token only lands once the *same* flyfun
+user redeems the code from their app — the victim's app would fail that check,
+and the attacker never sees the code, which goes to the victim's device.
 
 Env vars:
     AUTOROUTER_CLIENT_ID      – registered app ID (e.g. "flyfun_weather")
@@ -31,6 +41,7 @@ Env vars:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -40,6 +51,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -53,6 +65,7 @@ from flyfun_common.auth.config import (
 from flyfun_common.auth.jwt_utils import JWT_ALGORITHM
 from flyfun_common.auth.router import _is_safe_relative_path
 from flyfun_common.credentials import load_encrypted_creds, save_encrypted_creds
+from flyfun_common.encryption import decrypt, encrypt
 from flyfun_common.db.deps import current_user_id, get_db, optional_user_id
 
 logger = logging.getLogger(__name__)
@@ -64,11 +77,16 @@ AUTOROUTER_LOGS_URL = "https://api.autorouter.aero/v1.0/router/logs"
 _CREDS_KEY = "autorouter"
 
 # A link ticket only has to survive the tap between the app asking for it and
-# the in-app browser opening it, so it is short. It is a signed JWT rather than
-# a stored row: replaying one inside the window can only link an Autorouter
-# account to the ticket's own user, which is what its holder asked for anyway.
+# the in-app browser opening it, so it is short. It authenticates *starting*
+# the flow only; see the module docstring for why storing the token waits for
+# ``/autorouter/link-complete``.
 LINK_TICKET_TTL_SECONDS = 120
 _LINK_TICKET_PURPOSE = "autorouter_link"
+
+# The code handed back to the app: signed, short-lived, and carrying the
+# Autorouter token Fernet-encrypted so it is opaque on the device and in logs.
+LINK_CODE_TTL_SECONDS = 120
+_LINK_CODE_PURPOSE = "autorouter_link_complete"
 
 # Session key recording where the callback should send the user.
 _RETURN_KEY = "autorouter_return"
@@ -105,6 +123,27 @@ def decode_link_ticket(ticket: str, secret: str, *, verify_exp: bool = True) -> 
     return claims
 
 
+def create_link_code(user_id: str, token_data: dict, secret: str) -> str:
+    """Sign a one-time code that lets ``user_id`` store ``token_data``."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "purpose": _LINK_CODE_PURPOSE,
+        "uid": user_id,
+        "tok": encrypt(json.dumps(token_data)),
+        "iat": now,
+        "exp": now + timedelta(seconds=LINK_CODE_TTL_SECONDS),
+    }
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+
+
+def decode_link_code(code: str, secret: str) -> tuple[str, dict]:
+    """Validate a link code; return ``(user_id, token_data)`` or raise."""
+    claims = jwt.decode(code, secret, algorithms=[JWT_ALGORITHM])
+    if claims.get("purpose") != _LINK_CODE_PURPOSE or not claims.get("uid") or not claims.get("tok"):
+        raise jwt.InvalidTokenError("not an autorouter link code")
+    return claims["uid"], json.loads(decrypt(claims["tok"]))
+
+
 def _with_query_param(path: str, key: str, value: str) -> str:
     """``path`` with ``key=value`` added to (or replacing it in) its query string."""
     parts = urlsplit(path)
@@ -113,15 +152,16 @@ def _with_query_param(path: str, key: str, value: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def _app_callback_url(scheme: str, status: str, reason: str | None = None) -> str:
-    params = {"status": status}
-    if reason:
-        params["reason"] = reason
-    return f"{scheme}://autorouter/callback?{urlencode(params)}"
+def _app_callback_url(scheme: str, status: str, **params: str) -> str:
+    return f"{scheme}://autorouter/callback?{urlencode({'status': status, **params})}"
 
 
 class LinkTicketRequest(BaseModel):
     scheme: str
+
+
+class LinkCompleteRequest(BaseModel):
+    code: str
 
 
 def _get_client_id() -> str:
@@ -163,6 +203,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
 
     Provides:
         POST /autorouter/link-ticket       – native app: short-lived URL that starts linking
+        POST /autorouter/link-complete     – native app: redeem the callback code (stores token)
         GET  /autorouter/link              – start OAuth flow (redirects to Autorouter)
         GET  /auth/callback/autorouter     – handle redirect back from Autorouter
         GET  /autorouter/status            – check if user has linked account
@@ -235,7 +276,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
                 except jwt.InvalidTokenError:
                     raise HTTPException(status_code=401, detail="Invalid link ticket")
                 return RedirectResponse(
-                    url=_app_callback_url(stale["scheme"], "error", "expired"),
+                    url=_app_callback_url(stale["scheme"], "error", reason="expired"),
                     status_code=302,
                 )
             except jwt.InvalidTokenError:
@@ -286,7 +327,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
             # error page would strand the pilot inside the in-app browser.
             if app_scheme:
                 return RedirectResponse(
-                    url=_app_callback_url(app_scheme, "error", reason), status_code=302
+                    url=_app_callback_url(app_scheme, "error", reason=reason), status_code=302
                 )
             raise HTTPException(status_code=status_code, detail=detail)
 
@@ -331,16 +372,50 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
             logger.warning("Autorouter token response missing access_token: %s", token_data)
             return fail(502, "Invalid token response from Autorouter", "exchange_failed")
 
+        if app_scheme:
+            # Not stored yet: the app redeems this with its own bearer token
+            # (``/autorouter/link-complete``), which is what ties the Autorouter
+            # account to the user actually holding the app.
+            code = create_link_code(user_id, token_data, get_jwt_secret())
+            return RedirectResponse(
+                url=_app_callback_url(app_scheme, "authorized", code=code), status_code=302
+            )
+
         _store_token(db, user_id, token_data)
         logger.info("User %s linked Autorouter account", user_id)
 
-        if app_scheme:
-            redirect = _app_callback_url(app_scheme, "linked")
-        elif destination.get("next"):
+        if destination.get("next"):
             redirect = _with_query_param(destination["next"], "autorouter", "linked")
         else:
             redirect = success_redirect
         return RedirectResponse(url=redirect, status_code=302)
+
+    @router.post("/autorouter/link-complete")
+    async def link_complete(
+        body: LinkCompleteRequest,
+        user_id: str = Depends(current_user_id),
+        db: Session = Depends(get_db),
+    ):
+        """Store the Autorouter token from an app callback's code.
+
+        The code must have been issued for this same user — that check is the
+        defence against a ticket minted by someone else being approved here.
+        Redeeming twice just stores the same token again.
+        """
+        try:
+            code_user_id, token_data = decode_link_code(body.code, get_jwt_secret())
+        except (jwt.InvalidTokenError, InvalidToken, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid or expired link code")
+        if code_user_id != user_id:
+            logger.warning(
+                "Autorouter link code for user %s redeemed by user %s — rejected",
+                code_user_id, user_id,
+            )
+            raise HTTPException(status_code=403, detail="Link code belongs to another account")
+
+        _store_token(db, user_id, token_data)
+        logger.info("User %s linked Autorouter account (app)", user_id)
+        return {"linked": True}
 
     @router.get("/autorouter/status")
     async def status(
