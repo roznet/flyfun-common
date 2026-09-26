@@ -47,6 +47,9 @@ def linking(tmp_path, monkeypatch):
             return {"access_token": "ar-token", "token_type": "bearer"}
 
     class _FakeAsyncClient:
+        # Set to an exception to simulate Autorouter being unreachable.
+        fail_with: Exception | None = None
+
         async def __aenter__(self):
             return self
 
@@ -54,6 +57,8 @@ def linking(tmp_path, monkeypatch):
             return False
 
         async def post(self, url, data=None):
+            if _FakeAsyncClient.fail_with is not None:
+                raise _FakeAsyncClient.fail_with
             return _FakeResponse()
 
     monkeypatch.setattr(autorouter.httpx, "AsyncClient", _FakeAsyncClient)
@@ -61,7 +66,9 @@ def linking(tmp_path, monkeypatch):
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test")
     app.include_router(autorouter.create_autorouter_router())
-    return TestClient(app)
+    client = TestClient(app)
+    client.fake_autorouter = _FakeAsyncClient
+    return client
 
 
 def _state_from_authorize(resp) -> str:
@@ -243,3 +250,59 @@ def test_web_flow_errors_stay_http_errors(linking):
     linking.get("/autorouter/link", follow_redirects=False)
     resp = linking.get("/auth/callback/autorouter?code=abc&state=wrong", follow_redirects=False)
     assert resp.status_code == 400
+
+
+def test_unreachable_token_endpoint_returns_to_app_not_a_500(linking):
+    import httpx
+
+    linking.fake_autorouter.fail_with = httpx.ConnectTimeout("timed out")
+    state = _state_from_authorize(linking.get(_ticket_url(linking), follow_redirects=False))
+    resp = linking.get(
+        f"/auth/callback/autorouter?code=abc&state={state}", follow_redirects=False
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] == (
+        "flyfunweather://autorouter/callback?status=error&reason=exchange_failed"
+    )
+
+
+def test_expired_link_code_is_refused(linking):
+    from datetime import datetime, timedelta, timezone
+
+    from flyfun_common.auth.config import get_jwt_secret
+    from flyfun_common.auth.jwt_utils import JWT_ALGORITHM
+    from flyfun_common.encryption import encrypt
+
+    past = datetime.now(timezone.utc) - timedelta(minutes=10)
+    code = pyjwt.encode(
+        {
+            "purpose": "autorouter_link_complete",
+            "uid": "dev-user-001",
+            "tok": encrypt('{"access_token": "x"}'),
+            "iat": past,
+            "exp": past + timedelta(seconds=120),
+        },
+        get_jwt_secret(),
+        algorithm=JWT_ALGORITHM,
+    )
+    resp = linking.post("/autorouter/link-complete", json={"code": code})
+    assert resp.status_code == 400
+    assert linking.get("/autorouter/status").json()["linked"] is False
+
+
+def test_ticket_user_wins_over_the_browser_cookie_user(linking):
+    """Safari may hold a different flyfun user's cookie; the ticket decides."""
+    from flyfun_common.auth.config import get_jwt_secret
+    from flyfun_common.autorouter import create_link_ticket, decode_link_code
+
+    ticket = create_link_ticket("ticket-user", "flyfunweather", get_jwt_secret())
+    # dev mode: the request is also authenticated as dev-user-001 (the "cookie")
+    state = _state_from_authorize(
+        linking.get(f"/autorouter/link?ticket={ticket}", follow_redirects=False)
+    )
+    resp = linking.get(
+        f"/auth/callback/autorouter?code=abc&state={state}", follow_redirects=False
+    )
+    code = parse_qs(urlsplit(resp.headers["location"]).query)["code"][0]
+    uid, _ = decode_link_code(code, get_jwt_secret())
+    assert uid == "ticket-user"

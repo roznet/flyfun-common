@@ -114,3 +114,16 @@ def test_flights_read_denied_elsewhere(client, db_session):
     assert client.get("/api/flights/abc", headers=h).status_code == 403
     # unrelated endpoint
     assert client.get("/auth/me", headers=h).status_code == 403
+
+
+def test_flights_read_cannot_link_autorouter(client, db_session, monkeypatch):
+    """A read-only connector token must not start or complete an Autorouter link."""
+    from flyfun_common.autorouter import create_autorouter_router
+
+    monkeypatch.setenv("AUTOROUTER_CLIENT_ID", "flyfun_test")
+    client.app.include_router(create_autorouter_router())
+    h = _make_token(db_session, "flights:read")
+    r = client.post("/autorouter/link-ticket", json={"scheme": "flyfunweather"}, headers=h)
+    assert r.status_code == 403
+    r = client.post("/autorouter/link-complete", json={"code": "x"}, headers=h)
+    assert r.status_code == 403

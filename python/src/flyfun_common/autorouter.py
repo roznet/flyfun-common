@@ -298,13 +298,12 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
         request.session["autorouter_user_id"] = user_id
         request.session[_RETURN_KEY] = destination
 
-        authorize_url = (
-            f"{AUTOROUTER_AUTHORIZE_URL}"
-            f"?client_id={client_id}"
-            f"&redirect_uri={_callback_redirect_uri(request)}"
-            f"&response_type=code"
-            f"&state={state}"
-        )
+        authorize_url = f"{AUTOROUTER_AUTHORIZE_URL}?" + urlencode({
+            "client_id": client_id,
+            "redirect_uri": _callback_redirect_uri(request),
+            "response_type": "code",
+            "state": state,
+        })
         return RedirectResponse(url=authorize_url, status_code=302)
 
     @router.get("/auth/callback/autorouter", name="autorouter_callback")
@@ -344,17 +343,25 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
                 return fail(400, "Autorouter authorization was declined", "denied")
             return fail(400, "No authorization code received", "no_code")
 
-        # Exchange code for token — must happen within 30 seconds
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                AUTOROUTER_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "client_id": _get_client_id(),
-                    "client_secret": _get_client_secret(),
-                    "code": code,
-                    "redirect_uri": _callback_redirect_uri(request),
-                },
+        # Exchange code for token — must happen within 30 seconds. Every
+        # failure goes through fail(): a raw 500 would strand an app user in
+        # the in-app browser.
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    AUTOROUTER_TOKEN_URL,
+                    data={
+                        "grant_type": "authorization_code",
+                        "client_id": _get_client_id(),
+                        "client_secret": _get_client_secret(),
+                        "code": code,
+                        "redirect_uri": _callback_redirect_uri(request),
+                    },
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("Autorouter token exchange unreachable: %s", exc)
+            return fail(
+                502, "Failed to exchange authorization code with Autorouter", "exchange_failed"
             )
 
         if resp.status_code != 200:
@@ -367,8 +374,11 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
                 502, "Failed to exchange authorization code with Autorouter", "exchange_failed"
             )
 
-        token_data = resp.json()
-        if "access_token" not in token_data:
+        try:
+            token_data = resp.json()
+        except ValueError:
+            token_data = None
+        if not isinstance(token_data, dict) or "access_token" not in token_data:
             logger.warning("Autorouter token response missing access_token: %s", token_data)
             return fail(502, "Invalid token response from Autorouter", "exchange_failed")
 
