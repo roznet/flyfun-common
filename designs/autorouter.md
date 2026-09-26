@@ -35,11 +35,15 @@ User authorizes on Autorouter's site
 GET /auth/callback/autorouter?code=...&state=...   (or ?error=... if declined)
   → validates state (CSRF protection)
   → exchanges code for access token at Autorouter's token endpoint
+  → web: stores token encrypted in UserPreferencesRow, then redirects to
+      ?next= path + autorouter=linked, or success_redirect
+      (default /settings.html?autorouter=linked)
+  → app: stores NOTHING; redirects to
+      {scheme}://autorouter/callback?status=authorized&code=<link code>
+      ↓
+POST /autorouter/link-complete {code} (app's bearer)
+  → code's user must equal the bearer's user, else 403
   → stores token encrypted in UserPreferencesRow
-  → redirects to the return destination:
-      app ticket  → {scheme}://autorouter/callback?status=linked
-      web ?next=  → that path + autorouter=linked
-      otherwise   → success_redirect (default /settings.html?autorouter=linked)
 ```
 
 **Why a ticket for native apps.** An app holds only a bearer JWT in its
@@ -48,8 +52,22 @@ send an `Authorization` header — so `/autorouter/link` would 401 and the pilot
 would have to sign in to the website first. The ticket is a signed JWT
 (`purpose=autorouter_link`, 120 s) carrying the user id and the app's callback
 scheme, which must be in `OAUTH_ALLOWED_SCHEMES` both when issued and when
-used. It is not single-use: replay inside the window can only link an
-Autorouter account to the ticket's own user.
+used.
+
+**Why the app path redeems a code instead of storing at the callback
+(account-linking CSRF).** The ticket URL is a bearer-less capability: whoever
+opens it runs the flow *for the ticket's user*. If the callback stored the
+token, an attacker could mint a ticket for their own account (fresh on every
+click, so the TTL doesn't help), get a victim to tap Allow on the genuine
+autorouter.aero page, and the victim's Autorouter token would land on the
+attacker's account — exposing the victim's routes and flight plans. So the app
+callback carries a link code instead (signed JWT, 120 s,
+`purpose=autorouter_link_complete`, with the Autorouter token
+Fernet-encrypted inside so it is opaque on the device and in logs), and the
+token is stored only when the app redeems it with its own bearer and the
+code's user matches. A victim's app fails that check; the attacker never sees
+the code, which is delivered to the victim's device. The cookie web flow
+doesn't need this: its user comes from the approving browser's own session.
 
 **Errors on the app path never render an HTTP error page.** The pilot is inside
 an in-app browser waiting for the custom-scheme callback, so every failure
@@ -87,6 +105,7 @@ This uses the existing `credentials.py` helpers (Fernet encryption at rest) — 
 |--------|------|------|---------|
 | `POST` | `/autorouter/link-ticket` | Required (bearer) | Native app: short-lived URL that starts linking |
 | `GET` | `/autorouter/link` | Cookie or `ticket` | Start OAuth flow → redirect to Autorouter |
+| `POST` | `/autorouter/link-complete` | Required (bearer) | Native app: redeem the callback code; stores the token if the code is this user's |
 | `GET` | `/auth/callback/autorouter` | Session | Handle Autorouter redirect, exchange code |
 | `GET` | `/autorouter/status` | Required | Check if user has linked account |
 | `POST` | `/autorouter/unlink` | Required | Remove stored Autorouter token |

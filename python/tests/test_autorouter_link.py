@@ -99,19 +99,62 @@ def test_session_token_is_not_a_link_ticket():
 # --- native app flow ---------------------------------------------------------
 
 
-def test_app_flow_links_and_returns_to_app_scheme(linking):
+def _app_callback(linking) -> dict:
+    """Run ticket → authorize → callback; return the app callback's query."""
     url = _ticket_url(linking)
     assert "/autorouter/link?ticket=" in url
-
     state = _state_from_authorize(linking.get(url, follow_redirects=False))
     resp = linking.get(
         f"/auth/callback/autorouter?code=abc&state={state}", follow_redirects=False
     )
     assert resp.status_code == 302
-    assert resp.headers["location"] == "flyfunweather://autorouter/callback?status=linked"
+    location = resp.headers["location"]
+    assert location.startswith("flyfunweather://autorouter/callback?")
+    return {k: v[0] for k, v in parse_qs(urlsplit(location).query).items()}
 
-    status = linking.get("/autorouter/status").json()
-    assert status["linked"] is True
+
+def test_app_flow_stores_nothing_until_the_app_redeems_the_code(linking):
+    callback = _app_callback(linking)
+    assert callback["status"] == "authorized"
+    # The callback alone must not link: a ticket can be approved by someone
+    # other than the account that minted it.
+    assert linking.get("/autorouter/status").json()["linked"] is False
+
+    resp = linking.post("/autorouter/link-complete", json={"code": callback["code"]})
+    assert resp.status_code == 200, resp.text
+    assert linking.get("/autorouter/status").json()["linked"] is True
+
+
+def test_code_minted_for_another_account_is_refused(linking):
+    """Account-linking CSRF: attacker's ticket, victim approves, victim's app
+    redeems → the code names the attacker's account, so it's refused."""
+    from flyfun_common.auth.config import get_jwt_secret
+    from flyfun_common.autorouter import create_link_code
+
+    attacker_code = create_link_code(
+        "attacker-user", {"access_token": "victims-autorouter-token"}, get_jwt_secret()
+    )
+    resp = linking.post("/autorouter/link-complete", json={"code": attacker_code})
+    assert resp.status_code == 403
+    assert linking.get("/autorouter/status").json()["linked"] is False
+
+
+def test_forged_code_is_refused(linking):
+    from flyfun_common.autorouter import create_link_code
+
+    forged = create_link_code("dev-user-001", {"access_token": "x"}, "not-the-secret")
+    resp = linking.post("/autorouter/link-complete", json={"code": forged})
+    assert resp.status_code == 400
+    assert linking.get("/autorouter/status").json()["linked"] is False
+
+
+def test_link_code_hides_the_token():
+    from flyfun_common.autorouter import create_link_code, decode_link_code
+
+    code = create_link_code("u1", {"access_token": "secret-ar-token"}, "s" * 32)
+    claims = pyjwt.decode(code, options={"verify_signature": False})
+    assert "secret-ar-token" not in str(claims)
+    assert decode_link_code(code, "s" * 32) == ("u1", {"access_token": "secret-ar-token"})
 
 
 def test_link_ticket_rejects_unknown_scheme(linking):
