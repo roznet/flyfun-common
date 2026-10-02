@@ -205,8 +205,8 @@ Issues a new access token, rotates the refresh token, revokes the old access tok
 `db.deps` enforces scope per-endpoint via a registry (`register_scope_paths(scope, [(method, path_regex), …])`) that each app populates at startup. Enforcement runs inside `current_user_id` / `optional_user_id`, so any endpoint guarded by them is covered:
 
 - **No scope (NULL/empty)** → unrestricted. Keeps cookie/JWT sessions, manually-created tokens, and legacy OAuth tokens working unchanged.
-- **A scope not in the registry (e.g. `mcp`)** → treated as broad/full access. This is what keeps the claude.ai/Cowork MCP connector working — `mcp` is intentionally *not* registered as a limited scope.
-- **A token whose scopes are *all* registered (limited)** → may reach only the registered `(method, path)` endpoints for those scopes; anything else is **403 `insufficient_scope`** (with a `WWW-Authenticate: Bearer error="insufficient_scope"` header).
+- **A broad scope (`mcp`, plus any added with `register_broad_scope`)** → full access. This is what keeps the claude.ai/Cowork MCP connector working.
+- **Any other scope** → default-deny: the token may reach only the `(method, path)` endpoints registered *in this process* for its scopes; anything else is **403 `insufficient_scope`** (with a `WWW-Authenticate: Bearer error="insufficient_scope"` header). A scope the app never registered reaches nothing. This matters because the registry is per app while `api_tokens` is shared: a `flights:read` token issued by weather is refused everywhere on forms, which registers no scopes. (Before 0.6.9 unregistered scopes were treated as broad, which gave such a token full access on forms, including `DELETE /auth/account`.)
 
 Example (weatherbrief, #274): `register_scope_paths("flights:read", [("GET", r"/api/flights"), ("GET", r"/api/flights/[^/]+/export")])` — a `flights:read` token reads the flight list + per-flight export and is 403 everywhere else.
 

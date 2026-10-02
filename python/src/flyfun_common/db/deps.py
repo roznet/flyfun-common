@@ -32,12 +32,13 @@ _LEGACY_TOKEN_PREFIX = "wb_"  # accept old tokens during migration
 # cookie sessions, JWTs, manually-created API tokens, and legacy/pre-scope OAuth
 # tokens all carry no scope and keep full access.
 #
-# Only scopes registered here via ``register_scope_paths`` are "limited": a token
-# whose granted scopes are *all* limited may reach ONLY the (method, path)
-# endpoints registered for those scopes — everything else is 403
-# insufficient_scope (default-deny). A token that also carries an unregistered
-# scope (e.g. the broad ``mcp`` connector scope) is treated as full access, so
-# adding ``flights:read`` does not retroactively cage existing connectors.
+# A token carrying a *broad* scope (``mcp`` by default, see
+# ``register_broad_scope``) has full access. Every other scope is limited and
+# DEFAULT-DENY: it may reach only the (method, path) endpoints this process
+# registered for it via ``register_scope_paths``; everything else is 403
+# insufficient_scope. The registry is per process while ``api_tokens`` is
+# shared across apps, so a scope one app issues (e.g. weather's
+# ``flights:read``) reaches nothing on an app that never registered it.
 # ---------------------------------------------------------------------------
 _SCOPE_ALLOWLIST: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
 
@@ -53,23 +54,35 @@ def register_scope_paths(scope: str, rules: list[tuple[str, str]]) -> None:
     _SCOPE_ALLOWLIST[scope] = [(m.upper(), re.compile(p)) for m, p in rules]
 
 
-def _enforce_scope(request: Request, scope: str | None) -> None:
-    """Raise 403 if a limited-scope token may not reach this (method, path).
+_BROAD_SCOPES: set[str] = {"mcp"}
 
-    No-op for unrestricted tokens (no scope) and for tokens carrying any
-    scope that isn't in the limited registry (e.g. ``mcp`` → full access).
+
+def register_broad_scope(scope: str) -> None:
+    """Mark ``scope`` as broad: a token carrying it has full access.
+
+    ``mcp`` is broad by default (the claude.ai/Cowork connector scope). Broad
+    applies in every app that shares the token table, so only use it for
+    scopes whose consent screen already promises full account access.
+    """
+    _BROAD_SCOPES.add(scope)
+
+
+def _enforce_scope(request: Request, scope: str | None) -> None:
+    """Raise 403 if a scoped token may not reach this (method, path).
+
+    No-op for unrestricted tokens (no scope) and for tokens carrying a broad
+    scope. Any other scope is allowed only on the endpoints registered for it
+    in this process; an unregistered scope reaches nothing.
     """
     if not scope:
         return
     granted = scope.split()
-    limited = [s for s in granted if s in _SCOPE_ALLOWLIST]
-    if len(limited) != len(granted):
-        # Carries at least one unregistered (broad) scope → full access.
+    if any(s in _BROAD_SCOPES for s in granted):
         return
     method = request.method.upper()
     path = request.url.path
-    for s in limited:
-        for allowed_method, pattern in _SCOPE_ALLOWLIST[s]:
+    for s in granted:
+        for allowed_method, pattern in _SCOPE_ALLOWLIST.get(s, ()):
             if allowed_method in (method, "*") and pattern.fullmatch(path):
                 return
     raise HTTPException(
@@ -78,7 +91,7 @@ def _enforce_scope(request: Request, scope: str | None) -> None:
         headers={
             "WWW-Authenticate": (
                 'Bearer error="insufficient_scope", '
-                f'scope="{" ".join(limited)}"'
+                f'scope="{" ".join(granted)}"'
             )
         },
     )
