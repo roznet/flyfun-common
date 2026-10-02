@@ -115,6 +115,18 @@ def test_request_apple_private_relay_rejected(dev_env):
     assert "Sign in with Apple" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("email", ["victim@gm\u00e4il.com", "j\u00f6rg@example.com", "a\u0000b@example.com"])
+@pytest.mark.parametrize("path", ["/auth/magic-link/request", "/auth/magic-link/consume-code"])
+def test_non_ascii_or_control_email_rejected(dev_env, email, path):
+    """Accented look-alikes compare equal to ASCII addresses under MySQL's
+    accent-insensitive collations, so they are refused at the door."""
+    sent = []
+    client = TestClient(_build_app(send_callback=lambda *a, **k: sent.append(a)))
+    resp = client.post(path, json={"email": email, "code": "000000"})
+    assert resp.status_code == 422
+    assert sent == []
+
+
 def test_request_503_when_no_callback(dev_env):
     # Endpoint is only mounted when callback is wired, so the 503 path
     # is exercised by mounting with a callback and then forcing it None
@@ -421,6 +433,49 @@ def test_consume_matches_mixed_case_stored_email(dev_env):
 
     assert user.id == "mixed"
     assert user.provider == "google"
+
+
+def _fold_like_mysql_unicode_ci(value):
+    """Approximate utf8mb4_unicode_ci: case- and accent-insensitive."""
+    import unicodedata
+
+    if value is None:
+        return None
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
+def test_lookup_rechecks_matches_the_database_folds(dev_env):
+    """Even when the database says `gmäil.com` = `gmail.com` (as MySQL's
+    accent-insensitive collation does), the account is not picked. Requests
+    are ASCII-only, so the folded row is the stored, accented one."""
+    from flyfun_common.auth.magic_link import _user_with_email
+    from flyfun_common.db.engine import SessionLocal
+
+    _seed_google_user("accented", "Victim@gm\u00e4il.com")
+    _seed_google_user("plain", "Other@Example.com")
+    session = SessionLocal()
+    try:
+        raw = session.connection().connection.driver_connection
+        raw.create_function("lower", 1, _fold_like_mysql_unicode_ci)
+
+        assert _user_with_email(session, "victim@gmail.com") is None
+        assert _user_with_email(session, "other@example.com").id == "plain"
+    finally:
+        session.close()
+
+
+def test_lookup_prefers_exact_case_row(dev_env):
+    from flyfun_common.auth.magic_link import _user_with_email
+    from flyfun_common.db.engine import SessionLocal
+
+    _seed_google_user("mixed", "Dana@Example.com")
+    _seed_google_user("exact", "dana@example.com")
+    session = SessionLocal()
+    try:
+        assert _user_with_email(session, "dana@example.com").id == "exact"
+    finally:
+        session.close()
 
 
 def test_consume_expired_token_400(dev_env):
