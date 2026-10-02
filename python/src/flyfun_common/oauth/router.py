@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
@@ -57,18 +58,53 @@ def _oauth_error_redirect(
     if state:
         params["state"] = state
     sep = "&" if "?" in redirect_uri else "?"
-    url = f"{redirect_uri}{sep}{urlencode(params)}"
+    return _redirect_page(f"{redirect_uri}{sep}{urlencode(params)}")
+
+
+def _js_string_literal(value: str) -> str:
+    """A JS string literal that is safe inside an inline ``<script>``.
+
+    ``json.dumps`` alone escapes quotes but not ``<``, ``>`` or ``&``, so a
+    value containing ``</script>`` would close the script element and inject
+    markup. Those are emitted as ``\\uXXXX`` escapes, which decode back to
+    the same string (non-ASCII, incl. U+2028/2029, is already escaped by
+    ``json.dumps``'s default ``ensure_ascii``).
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def _redirect_page(url: str) -> HTMLResponse:
+    """Redirect via meta-refresh + JS instead of HTTP 303.
+
+    Some OAuth clients (claude.ai) intercept form submissions via fetch(),
+    which mishandles HTTP redirects. ``url`` embeds the client's registered
+    redirect_uri, which is attacker-chosen under open registration, so it is
+    escaped for each context it lands in.
+    """
     return HTMLResponse(
         content=(
             f'<html><head><meta http-equiv="refresh" content="0;url={html_escape(url)}">'
-            f'</head><body><script>window.location.href={json.dumps(url)};</script>'
+            f'</head><body><script>window.location.href={_js_string_literal(url)};</script>'
             f'<p>Redirecting...</p></body></html>'
         ),
     )
 
 
+# Characters RFC 3986 never allows in a URI. Rejecting them at registration
+# keeps markup and whitespace out of stored redirect URIs altogether; output
+# escaping in _redirect_page remains the primary defence.
+_FORBIDDEN_URI_CHARS = re.compile(r'[\x00-\x20\x7f<>"`{}|\\^]')
+
+
 def _validate_redirect_uri(uri: str) -> bool:
     """HTTPS, http-loopback (dev), or an RFC 8252 private-use scheme (native apps)."""
+    if _FORBIDDEN_URI_CHARS.search(uri):
+        return False
     parsed = urlparse(uri)
     if parsed.scheme == "https":
         return True
@@ -486,17 +522,7 @@ def create_oauth_router(
         if state:
             params["state"] = state
         sep = "&" if "?" in redirect_uri else "?"
-        callback_url = f"{redirect_uri}{sep}{urlencode(params)}"
-
-        # Use JS redirect instead of HTTP 303 — some OAuth clients (claude.ai)
-        # intercept form submissions via fetch(), which mishandles HTTP redirects.
-        return HTMLResponse(
-            content=(
-                f'<html><head><meta http-equiv="refresh" content="0;url={html_escape(callback_url)}">'
-                f'</head><body><script>window.location.href={json.dumps(callback_url)};</script>'
-                f'<p>Redirecting...</p></body></html>'
-            ),
-        )
+        return _redirect_page(f"{redirect_uri}{sep}{urlencode(params)}")
 
     # ---- Token Endpoint ----
 

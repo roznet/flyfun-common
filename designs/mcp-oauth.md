@@ -88,7 +88,7 @@ Response:
 }
 ```
 
-`redirect_uris` are validated by `_validate_redirect_uri`: **HTTPS**, **http loopback** (`localhost`/`127.0.0.1`, for dev), or an **RFC 8252 §7.1 private-use URI scheme** — a reverse-domain scheme like `net.ro-z.flyfun-example://oauth-callback` used by native iOS/Android apps (#274).
+`redirect_uris` are validated by `_validate_redirect_uri`: **HTTPS**, **http loopback** (`localhost`/`127.0.0.1`, for dev), or an **RFC 8252 §7.1 private-use URI scheme** — a reverse-domain scheme like `net.ro-z.flyfun-example://oauth-callback` used by native iOS/Android apps (#274). URIs containing whitespace, control characters or characters RFC 3986 never allows (`` <>"`{}|\^ ``) are rejected. Independently, the HTML redirect pages (error and approve) escape the URL for both the meta-refresh attribute and the inline script, so a stored URI can never inject markup.
 
 **New table: `oauth_clients`**
 

@@ -113,6 +113,20 @@ def test_register_client_invalid_redirect_uri(client):
     assert "HTTPS" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("uri", [
+    "https://example.com/</script><script>alert(1)</script>",
+    'https://example.com/cb"onload="x',
+    "https://example.com/c b",
+    "https://example.com/cb\n",
+])
+def test_register_client_rejects_markup_in_redirect_uri(client, uri):
+    resp = client.post("/oauth/register", json={
+        "client_name": "Bad Client",
+        "redirect_uris": [uri],
+    })
+    assert resp.status_code == 400
+
+
 def test_register_client_localhost_allowed(client):
     resp = client.post("/oauth/register", json={
         "client_name": "Dev Client",
@@ -248,13 +262,9 @@ def test_authorize_rejects_bad_redirect_uri(client):
 def _extract_redirect_url(resp):
     """Extract redirect URL from JS redirect HTML response."""
     assert resp.status_code == 200
-    match = re.search(r'window\.location\.href="([^"]+)"', resp.text)
-    if not match:
-        match = re.search(r'window\.location\.href=(".*?")', resp.text)
-        if match:
-            return json.loads(match.group(1))
+    match = re.search(r'window\.location\.href=("(?:[^"\\]|\\.)*")', resp.text)
     assert match, f"No redirect URL found in: {resp.text[:200]}"
-    return match.group(1)
+    return json.loads(match.group(1))
 
 
 def test_authorize_approve(client):
@@ -332,6 +342,92 @@ def test_authorize_rejects_invalid_scope(client):
     location = _extract_redirect_url(resp)
     params = parse_qs(urlparse(location).query)
     assert params["error"] == ["invalid_scope"]
+
+
+_SCRIPT_BREAKOUT_URI = "https://example.com/cb?x=</script><script>alert(document.domain)</script>"
+
+
+def _seed_client(db_session, redirect_uri):
+    """Insert a client directly, bypassing registration-time URI checks
+    (as a row registered before those checks existed would be)."""
+    row = OAuthClientRow(
+        id="mcp_seeded",
+        client_secret_hash=hash_token("unused"),
+        client_name="Seeded",
+        redirect_uris_json=json.dumps([redirect_uri]),
+    )
+    db_session.add(row)
+    db_session.commit()
+    return row.id
+
+
+def _assert_single_inert_script(html, expected_url):
+    """The page holds exactly one <script>, and it redirects to expected_url."""
+    from html.parser import HTMLParser
+
+    class _Scripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.scripts, self._in = [], False
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "script":
+                self._in = True
+                self.scripts.append("")
+
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self._in = False
+
+        def handle_data(self, data):
+            if self._in:
+                self.scripts[-1] += data
+
+    parser = _Scripts()
+    parser.feed(html)
+    assert len(parser.scripts) == 1, parser.scripts
+    literal = re.fullmatch(r"window\.location\.href=(\".*\");", parser.scripts[0])
+    assert literal, parser.scripts[0]
+    assert json.loads(literal.group(1)) == expected_url
+
+
+def test_error_redirect_does_not_let_redirect_uri_break_out_of_script(client, db_session):
+    """A stored redirect_uri carrying </script> must not inject markup into the
+    error page served before consent (invalid scope)."""
+    client_id = _seed_client(db_session, _SCRIPT_BREAKOUT_URI)
+    resp = client.get("/oauth/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": _SCRIPT_BREAKOUT_URI,
+        "response_type": "code",
+        "scope": "bogus",
+        "state": "s",
+    })
+    assert resp.status_code == 200
+    assert "<script>alert" not in resp.text
+    location = _extract_redirect_url(resp)
+    assert location.startswith(_SCRIPT_BREAKOUT_URI + "&")
+    assert parse_qs(urlparse(location).query)["error"] == ["invalid_scope"]
+    _assert_single_inert_script(resp.text, location)
+
+
+def test_approve_redirect_does_not_let_redirect_uri_break_out_of_script(client, db_session):
+    client_id = _seed_client(db_session, _SCRIPT_BREAKOUT_URI)
+    _, challenge = _make_challenge()
+    csrf = _get_csrf_token(client, client_id, challenge, _SCRIPT_BREAKOUT_URI)
+    resp = client.post("/oauth/authorize", data={
+        "action": "approve",
+        "client_id": client_id,
+        "redirect_uri": _SCRIPT_BREAKOUT_URI,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+        "scope": "mcp",
+        "csrf_token": csrf,
+    })
+    assert "<script>alert" not in resp.text
+    location = _extract_redirect_url(resp)
+    assert "code" in parse_qs(urlparse(location).query)
+    _assert_single_inert_script(resp.text, location)
 
 
 def _multi_scope_client(db_session):
