@@ -4,6 +4,8 @@ Covers the #274 Phase 2 contract:
 - unscoped tokens (manual/legacy) and broad scopes (mcp) keep full access
 - a token scoped only to ``flights:read`` reaches only its registered endpoints
   and is 403 ``insufficient_scope`` everywhere else
+- default-deny: a scope this process never registered reaches nothing (the
+  token table is shared across apps, the registry is not)
 """
 
 import os
@@ -41,6 +43,7 @@ def client(db_session, monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     deps._SCOPE_ALLOWLIST.clear()
+    monkeypatch.setattr(deps, "_BROAD_SCOPES", {"mcp"})
     register_scope_paths(
         "flights:read",
         [("GET", r"/api/flights"), ("GET", r"/api/flights/[^/]+/export")],
@@ -127,3 +130,39 @@ def test_flights_read_cannot_link_autorouter(client, db_session, monkeypatch):
     assert r.status_code == 403
     r = client.post("/autorouter/link-complete", json={"code": "x"}, headers=h)
     assert r.status_code == 403
+
+
+def test_scope_unregistered_in_this_app_is_denied(client, db_session):
+    """Another app's limited scope (registered there, not here) gets nothing:
+    in particular not account-level endpoints like /auth/me."""
+    deps._SCOPE_ALLOWLIST.clear()  # this process registered no scopes
+    h = _make_token(db_session, "flights:read")
+    for method, path in [
+        ("GET", "/api/flights"),
+        ("POST", "/api/flights"),
+        ("GET", "/auth/me"),
+    ]:
+        r = client.request(method, path, headers=h)
+        assert r.status_code == 403, (method, path)
+        assert r.json()["detail"] == "insufficient_scope"
+
+
+def test_unknown_scope_is_denied(client, db_session):
+    h = _make_token(db_session, "something:else")
+    assert client.get("/auth/me", headers=h).status_code == 403
+    assert client.get("/api/flights", headers=h).status_code == 403
+
+
+def test_broad_scope_alongside_limited_has_full_access(client, db_session):
+    h = _make_token(db_session, "flights:read mcp")
+    assert client.post("/api/flights", headers=h).status_code == 200
+    assert client.get("/auth/me", headers=h).status_code == 200
+
+
+def test_register_broad_scope(client, db_session):
+    from flyfun_common.db import register_broad_scope
+
+    h = _make_token(db_session, "full")
+    assert client.get("/auth/me", headers=h).status_code == 403
+    register_broad_scope("full")
+    assert client.get("/auth/me", headers=h).status_code == 200
