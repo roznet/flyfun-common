@@ -349,6 +349,80 @@ def test_consume_existing_apple_user_keeps_apple_provider(dev_env):
         session.close()
 
 
+def _seed_google_user(user_id: str, email: str) -> None:
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    session = SessionLocal()
+    try:
+        session.add(
+            UserRow(
+                id=user_id,
+                provider="google",
+                provider_sub=f"google-{user_id}",
+                email=email,
+                display_name="Existing",
+                approved=True,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _consume_and_get_user(email: str):
+    """Consume a fresh magic link for ``email``; return the signed-in UserRow."""
+    from flyfun_common.auth.config import COOKIE_NAME, get_jwt_secret
+    from flyfun_common.auth.jwt_utils import decode_token
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    client = TestClient(_build_app(send_callback=lambda *a, **k: None))
+    resp = client.post(
+        "/auth/magic-link/consume",
+        json={"token": _seed_token(email)},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    jwt = client.cookies.get(COOKIE_NAME)
+    user_id = decode_token(jwt, get_jwt_secret())["sub"]
+    session = SessionLocal()
+    try:
+        return session.get(UserRow, user_id)
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize(
+    "victim, attacker",
+    [
+        ("john.doe@outlook.com", "john_doe@outlook.com"),
+        ("alice@example.com", "a%@example.com"),
+        ("Bob.Smith@Example.com", "bob_smith@example.com"),
+    ],
+)
+def test_consume_wildcard_email_does_not_match_another_user(dev_env, victim, attacker):
+    """`_` and `%` in the requested address are literal characters, never
+    pattern wildcards that could sign someone into another account."""
+    _seed_google_user("victim", victim)
+
+    user = _consume_and_get_user(attacker)
+
+    assert user.id != "victim"
+    assert user.email == attacker
+    assert user.provider == "email"
+
+
+def test_consume_matches_mixed_case_stored_email(dev_env):
+    """Providers' emails are stored as given; the lookup stays case-insensitive."""
+    _seed_google_user("mixed", "Carol.Jones@Example.com")
+
+    user = _consume_and_get_user("carol.jones@example.com")
+
+    assert user.id == "mixed"
+    assert user.provider == "google"
+
+
 def test_consume_expired_token_400(dev_env):
     app = _build_app(send_callback=lambda *a, **k: None)
     client = TestClient(app)

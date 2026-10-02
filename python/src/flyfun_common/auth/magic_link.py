@@ -37,6 +37,7 @@ from urllib.parse import urlencode, urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import (
@@ -167,11 +168,13 @@ def _find_or_create_user_by_email(
         .first()
     )
     if user is None:
-        # Fall back to case-insensitive search for legacy rows that may have
-        # been stored with mixed case.
+        # Fall back to a case-insensitive match for rows stored with mixed
+        # case (OAuth providers' emails are stored as given). Exact equality on
+        # lower(): never LIKE/ILIKE, where `_` and `%` in the requested address
+        # would act as wildcards and match someone else's account.
         user = (
             db.query(UserRow)
-            .filter(UserRow.email.ilike(email_lower))
+            .filter(func.lower(UserRow.email) == email_lower)
             .first()
         )
 
