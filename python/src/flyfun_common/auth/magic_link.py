@@ -146,6 +146,27 @@ def _build_verify_link(request: Request, token: str, next_path: str | None) -> s
     return f"{base}?{urlencode(params)}"
 
 
+def _user_with_email(db: Session, email_lower: str) -> UserRow | None:
+    """The user whose stored email equals ``email_lower`` ignoring case only.
+
+    SQL narrows the candidates; Python decides. The database comparison
+    depends on its collation (MySQL's ``utf8mb4_unicode_ci`` also ignores
+    accents and folds ``ß``/``ss``, so ``gmäil.com`` = ``gmail.com``), and
+    LIKE would add wildcards. Neither may pick the account. Rows stored with
+    mixed case (OAuth providers' emails are kept as given) still match; an
+    exact-case row wins over those.
+    """
+    candidates = (
+        db.query(UserRow)
+        .filter(func.lower(UserRow.email) == email_lower)
+        .all()
+    )
+    matches = [u for u in candidates if _normalize_email(u.email or "") == email_lower]
+    return next((u for u in matches if u.email == email_lower), None) or next(
+        iter(matches), None
+    )
+
+
 def _find_or_create_user_by_email(
     db: Session,
     email: str,
@@ -162,21 +183,7 @@ def _find_or_create_user_by_email(
     ``provider='google'``).
     """
     email_lower = _normalize_email(email)
-    user = (
-        db.query(UserRow)
-        .filter(UserRow.email == email_lower)
-        .first()
-    )
-    if user is None:
-        # Fall back to a case-insensitive match for rows stored with mixed
-        # case (OAuth providers' emails are stored as given). Exact equality on
-        # lower(): never LIKE/ILIKE, where `_` and `%` in the requested address
-        # would act as wildcards and match someone else's account.
-        user = (
-            db.query(UserRow)
-            .filter(func.lower(UserRow.email) == email_lower)
-            .first()
-        )
+    user = _user_with_email(db, email_lower)
 
     if user is None:
         user = UserRow(
@@ -231,7 +238,10 @@ def purge_expired_magic_link_tokens(
 
 def _validate_email(value: str) -> str:
     value = value.strip()
-    if not _EMAIL_RE.match(value):
+    # ASCII only: accented/IDN look-alikes (`gmäil.com`) compare equal to
+    # their ASCII originals under MySQL's accent-insensitive collations, and
+    # the link is mailed to the address as typed.
+    if not (value.isascii() and value.isprintable() and _EMAIL_RE.match(value)):
         raise ValueError("not a valid email address")
     return value
 
@@ -440,6 +450,8 @@ def build_magic_link_router(
             .order_by(MagicLinkTokenRow.created_at.desc())
             .all()
         )
+        # Same collation caveat as _user_with_email: keep exact matches only.
+        candidates = [r for r in candidates if r.email == email_lower]
         match = next(
             (
                 r
