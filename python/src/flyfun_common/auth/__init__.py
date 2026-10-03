@@ -17,7 +17,10 @@ from flyfun_common.auth.jwt_utils import (
     get_jwt_refresh_threshold_days,
 )
 from flyfun_common.auth.magic_link import purge_expired_magic_link_tokens
-from flyfun_common.auth.middleware import SlidingSessionMiddleware
+from flyfun_common.auth.middleware import (
+    SlidingSessionMiddleware,
+    mark_session_authenticated,
+)
 from flyfun_common.auth.router import create_auth_router
 
 __all__ = [
@@ -34,6 +37,7 @@ __all__ = [
     "get_jwt_expiry_days",
     "get_jwt_refresh_threshold_days",
     "SlidingSessionMiddleware",
+    "mark_session_authenticated",
     "create_auth_router",
     "purge_expired_magic_link_tokens",
 ]

@@ -51,7 +51,7 @@ GET /auth/login/google → Google consent → GET /auth/callback/google
   Issue JWT → set cookie (domain=.flyfun.aero) → redirect to /
 ```
 
-iOS variant: `?platform=ios` on login → callback redirects to `flyfun://auth/callback?token=...` instead of setting cookie.
+Native variant (iOS and Android): `?platform=ios&scheme=<allowlisted>&state=<nonce>` on login, optionally with `code_challenge=<S256>&code_challenge_method=S256` (PKCE). The callback redirects to `<scheme>://auth/callback?code=...&state=...` instead of setting a cookie, and the app POSTs `code`, `state` (and `code_verifier`) to `/auth/exchange` for the session JWT. A native login without scheme and state is refused; see [oauth-deeplink-hardening.md](oauth-deeplink-hardening.md).
 
 ### Magic-link (email) flow
 

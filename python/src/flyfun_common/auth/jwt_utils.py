@@ -22,11 +22,13 @@ _DEFAULT_REFRESH_THRESHOLD_DAYS = 15
 # an injected callback can't authenticate the victim.
 #
 # NOTE: this is a *stateless* code, deliberately NOT single-use — there is no
-# server-side used-code store. The short TTL bounds the replay window rather
-# than eliminating it: a code+state callback URL that leaks (e.g. proxy/302
-# logs) within the TTL can be replayed to mint the user's session. Accepted
-# residual — the callback is captured privately by ASWebAuthenticationSession
-# (not broadcast to other apps) and the window is short.
+# server-side used-code store. The short TTL bounds the replay window. A client
+# that sends a PKCE ``code_challenge`` at /auth/login gets a code bound to it
+# (``cc`` claim), and /auth/exchange then requires the matching
+# ``code_verifier``: a callback URL that leaks or is intercepted (any Android
+# app can register a custom scheme; ASWebAuthenticationSession on iOS delivers
+# privately) cannot be redeemed without the verifier, which never leaves the
+# app. Clients that send no challenge keep the TTL-only protection.
 EXCHANGE_CODE_TTL_SECONDS = 60
 _EXCHANGE_CODE_PURPOSE = "oauth_exchange"
 
@@ -80,11 +82,13 @@ def create_exchange_code(
     state: str,
     secret: str,
     ttl_seconds: int = EXCHANGE_CODE_TTL_SECONDS,
+    code_challenge: str | None = None,
 ) -> str:
     """Mint a short-TTL, signed authorization code for the deep-link exchange.
 
-    Carries the user id and the client's ``state`` nonce — NOT the session
-    token. Verified and traded for the session JWT at ``/auth/exchange``.
+    Carries the user id, the client's ``state`` nonce and, when the client
+    used PKCE, its S256 ``code_challenge`` — NOT the session token. Verified
+    and traded for the session JWT at ``/auth/exchange``.
     """
     now = datetime.now(timezone.utc)
     payload = {
@@ -94,6 +98,8 @@ def create_exchange_code(
         "iat": now,
         "exp": now + timedelta(seconds=ttl_seconds),
     }
+    if code_challenge:
+        payload["cc"] = code_challenge
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 

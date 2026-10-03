@@ -5,6 +5,15 @@ Status: **implemented (v1-direct)**, 2026-07-02. Addresses SECURITY_AUDIT.md
 `flyfun-common` (Python auth router + Swift auth client) and each native app.
 Related: [ios-auth.md](ios-auth.md), [auth.md](auth.md).
 
+**Update 0.6.9 (2026-10):**
+- **The legacy branch is removed.** `/auth/login` with `platform=ios` now requires an allowlisted `scheme` and a `state` (400 otherwise), and the callback never puts the session JWT in a URL or falls back to the old `flyfun` default scheme. App builds that predate `state` can no longer sign in and must update.
+- **PKCE.** `/auth/login` accepts an optional `code_challenge` (S256 only, `code_challenge_method=S256`). It is bound into the exchange code as a `cc` claim, and `/auth/exchange` then requires the matching `code_verifier`.
+  - This closes the interception residual in item 2 for clients that use it: on Android any app can register the custom scheme, and an intercepted `code`+`state` is useless without the verifier.
+  - Clients that send no challenge are unchanged.
+  - The Android forms app sends one. The Swift `FlyFunAuthService` does not yet; on iOS `ASWebAuthenticationSession` already delivers the callback privately.
+
+Items 1 and 2 below describe the state before this update.
+
 ## What shipped (deviations from the original design below)
 
 1. **State-gated emission (not the original always-emit-both).** The iOS
