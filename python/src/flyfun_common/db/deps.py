@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import COOKIE_NAME, get_jwt_secret
 from flyfun_common.auth.jwt_utils import decode_token
+from flyfun_common.auth.middleware import mark_session_authenticated
 from flyfun_common.db.engine import DEV_USER_ID, SessionLocal, is_dev_mode
 from flyfun_common.db.models import ApiTokenRow, UserRow
 
@@ -206,6 +207,16 @@ def _is_session_revoked(user: UserRow, token_iat: int | None) -> bool:
     return token_iat < valid_after.timestamp()
 
 
+def _mark_if_session(request: Request, user_id: str, token_iat: int | None) -> None:
+    """Allow SlidingSessionMiddleware to renew this request's session JWT.
+
+    Only for JWT auth (``token_iat`` set); ``ff_`` API tokens are never
+    renewed. Called only after every check above has passed.
+    """
+    if token_iat is not None:
+        mark_session_authenticated(request, user_id)
+
+
 def current_user_id(
     request: Request,
     db: Session = Depends(get_db),
@@ -227,6 +238,7 @@ def current_user_id(
             status_code=401, detail="Session revoked, please sign in again"
         )
 
+    _mark_if_session(request, user_id, token_iat)
     return user_id
 
 
@@ -256,4 +268,5 @@ def optional_user_id(
     if _is_session_revoked(user, token_iat):
         return None
 
+    _mark_if_session(request, user_id, token_iat)
     return user_id

@@ -16,6 +16,14 @@ If both a cookie and a Bearer token are present on the request, the cookie
 takes precedence and only `Set-Cookie` is emitted (matches the assumption
 that browser flows own the cookie path).
 
+A token is only renewed when THIS request authenticated with it: the auth
+dependencies (`current_user_id` / `optional_user_id`) call
+`mark_session_authenticated` once every check has passed (user exists, not
+suspended, not revoked by "log out everywhere"), and the middleware renews
+only if that user is the token's `sub`. Decoding the token is not enough: on a
+public route nothing checks revocation, so a revoked token would otherwise be
+reissued with a fresh `iat` and pass the epoch check again.
+
 For browsers consuming `X-Renewed-Token` from a different origin, expose
 the header via CORS in the host app:
 
@@ -50,6 +58,20 @@ logger = logging.getLogger(__name__)
 
 RENEWED_TOKEN_HEADER = "X-Renewed-Token"
 
+# ASGI scope key the auth dependencies set to the user id they authenticated
+# from the session JWT (cookie or Bearer). Request.scope is the same dict the
+# middleware holds, so it can read it when the response starts.
+_AUTHENTICATED_SUB_KEY = "flyfun.session_authenticated_sub"
+
+
+def mark_session_authenticated(request, user_id: str) -> None:
+    """Record that this request authenticated ``user_id`` from its session JWT.
+
+    Called by the auth dependencies after every check has passed. Only a
+    marked request can have its token renewed by SlidingSessionMiddleware.
+    """
+    request.scope[_AUTHENTICATED_SUB_KEY] = user_id
+
 
 class SlidingSessionMiddleware:
     """Refresh the user's JWT when it's close to expiring.
@@ -62,7 +84,9 @@ class SlidingSessionMiddleware:
       * Fires on HTTP requests carrying either a still-valid `flyfun_auth`
         cookie or an `Authorization: Bearer <jwt>` header.
       * Refreshes when the token's remaining lifetime is below
-        JWT_REFRESH_THRESHOLD_DAYS (default 15).
+        JWT_REFRESH_THRESHOLD_DAYS (default 15), and only if the request
+        authenticated with it (see ``mark_session_authenticated``). Public
+        routes never renew.
       * Cookie input → `Set-Cookie: flyfun_auth=…` on the response.
       * Bearer input → `X-Renewed-Token: <jwt>` on the response.
       * If the response already sets the corresponding header itself
@@ -85,17 +109,18 @@ class SlidingSessionMiddleware:
             await self.app(scope, receive, send)
             return
 
-        transport, value = action
+        transport, value, sub = action
 
         async def send_wrapper(message):
-            # Only roll the token forward on a successful response. A rejected
-            # request (401 revoked-session / expired, 403 suspended) must NOT
-            # receive a freshly-minted cookie/header — otherwise a revoked or
-            # near-expiry stolen token in its refresh window would be reissued
-            # with a new `iat`, defeating session-epoch revocation.
+            # Only roll the token forward when this request authenticated with
+            # it (the dependency marked the token's own user), and only on a
+            # successful response. Otherwise a revoked or suspended token in
+            # its refresh window would be reissued with a new `iat` on any
+            # public route, defeating session-epoch revocation.
             if (
                 message["type"] == "http.response.start"
                 and message.get("status", 200) < 400
+                and scope.get(_AUTHENTICATED_SUB_KEY) == sub
             ):
                 headers = list(message.get("headers", []))
                 if transport == "cookie":
@@ -113,28 +138,39 @@ class SlidingSessionMiddleware:
 
         await self.app(scope, receive, send_wrapper)
 
-    def _maybe_refresh_action(self, scope: Scope) -> tuple[str, str] | None:
+    def _maybe_refresh_action(
+        self, scope: Scope
+    ) -> tuple[str, str, str] | None:
+        """(transport, header value, token sub) for a renewable token, or None."""
         cookie = _extract_cookie(scope, COOKIE_NAME)
         if cookie:
-            new_token = self._maybe_refresh_token(cookie)
-            if new_token is None:
+            refreshed = self._maybe_refresh_token(cookie)
+            if refreshed is None:
                 return None
-            return ("cookie", _build_cookie_header(new_token, get_jwt_cookie_max_age()))
+            new_token, sub = refreshed
+            return (
+                "cookie",
+                _build_cookie_header(new_token, get_jwt_cookie_max_age()),
+                sub,
+            )
 
         bearer = _extract_bearer(scope)
         if bearer:
-            new_token = self._maybe_refresh_token(bearer)
-            if new_token is None:
+            refreshed = self._maybe_refresh_token(bearer)
+            if refreshed is None:
                 return None
-            return ("bearer", new_token)
+            new_token, sub = refreshed
+            return ("bearer", new_token, sub)
 
         return None
 
-    def _maybe_refresh_token(self, current_token: str) -> str | None:
+    def _maybe_refresh_token(self, current_token: str) -> tuple[str, str] | None:
         """Decode `current_token` and mint a successor if it's near expiry.
 
-        Returns None when the token can't be decoded, has no exp/sub, is
-        outside the refresh window, or when re-issuance fails.
+        Returns ``(new_token, sub)``, or None when the token can't be decoded,
+        has no exp/sub, is outside the refresh window, or when re-issuance
+        fails. Whether the successor is actually sent is decided per request
+        in ``__call__``.
         """
         try:
             payload = decode_token(current_token, get_jwt_secret())
@@ -152,7 +188,7 @@ class SlidingSessionMiddleware:
             return None
 
         try:
-            return create_token(
+            new_token = create_token(
                 sub,
                 payload.get("email", ""),
                 payload.get("name", ""),
@@ -163,6 +199,7 @@ class SlidingSessionMiddleware:
                 "SlidingSessionMiddleware failed to refresh token", exc_info=True
             )
             return None
+        return new_token, sub
 
 
 def _extract_cookie(scope: Scope, name: str) -> str | None:
