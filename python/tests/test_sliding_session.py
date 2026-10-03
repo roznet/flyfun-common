@@ -14,7 +14,7 @@ from http.cookies import SimpleCookie
 
 import jwt as pyjwt
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
@@ -22,7 +22,10 @@ from starlette.middleware.sessions import SessionMiddleware
 from flyfun_common.auth import router as auth_router
 from flyfun_common.auth.config import COOKIE_NAME
 from flyfun_common.auth.jwt_utils import JWT_ALGORITHM
-from flyfun_common.auth.middleware import SlidingSessionMiddleware
+from flyfun_common.auth.middleware import (
+    SlidingSessionMiddleware,
+    mark_session_authenticated,
+)
 from flyfun_common.auth.router import _is_safe_relative_path, create_auth_router
 
 
@@ -111,7 +114,23 @@ def _app_with_middleware(secret: str) -> FastAPI:
     app.add_middleware(SlidingSessionMiddleware)
 
     @app.get("/echo")
-    def echo():
+    def echo(request: Request):
+        # Stands in for a route guarded by current_user_id: mark the token's
+        # user as authenticated (cookie first, like the real dependency).
+        token = request.cookies.get(COOKIE_NAME)
+        if not token:
+            auth = request.headers.get("authorization", "")
+            token = auth[7:] if auth.startswith("Bearer ") else None
+        try:
+            sub = pyjwt.decode(token, secret, algorithms=[JWT_ALGORITHM])["sub"]
+        except Exception:
+            sub = None
+        if sub:
+            mark_session_authenticated(request, sub)
+        return {"ok": True}
+
+    @app.get("/public")
+    def public():
         return {"ok": True}
 
     @app.get("/logout-like")
@@ -522,3 +541,105 @@ def test_logout_all_bumps_epoch(tmp_path, monkeypatch):
     finally:
         s.close()
         reset_engine()
+
+
+# ---------- renewal only for requests that authenticated (N6) ----------
+
+
+@pytest.mark.parametrize("transport", ["cookie", "bearer"])
+def test_middleware_does_not_renew_on_unauthenticated_route(transport):
+    """Decoding a near-expiry token is not enough: a route that never checked
+    it (and so never checked revocation) must not renew it."""
+    secret = "test-secret-public"
+    client = TestClient(_app_with_middleware(secret))
+    token = _forge_token(secret, exp_in=timedelta(days=5))
+    headers = {}
+    if transport == "cookie":
+        client.cookies.set(COOKIE_NAME, token)
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = client.get("/public", headers=headers)
+    assert resp.status_code == 200
+    assert _session_cookie_from(resp) is None
+    assert _renewed_token_from(resp) is None
+
+
+def test_middleware_does_not_renew_when_other_user_authenticated():
+    secret = "test-secret-other"
+    app = _app_with_middleware(secret)
+
+    @app.get("/marks-someone-else")
+    def marks_someone_else(request: Request):
+        mark_session_authenticated(request, "someone-else")
+        return {"ok": True}
+
+    client = TestClient(app)
+    client.cookies.set(COOKIE_NAME, _forge_token(secret, exp_in=timedelta(days=5)))
+    assert _session_cookie_from(client.get("/marks-someone-else")) is None
+
+
+def _epoch_app_with_routes(epoch_app):
+    from fastapi import Depends
+
+    from flyfun_common.db.deps import optional_user_id
+
+    epoch_app.add_middleware(SlidingSessionMiddleware)
+
+    @epoch_app.get("/health")
+    def health():
+        return {"ok": True}
+
+    @epoch_app.get("/maybe")
+    def maybe(user_id: str | None = Depends(optional_user_id)):
+        return {"user_id": user_id}
+
+    return TestClient(epoch_app)
+
+
+def test_revoked_token_not_renewed_anywhere(epoch_app):
+    """After "log out everywhere", a stolen token in its refresh window gets no
+    successor from a public route, an optional-auth route or a protected one."""
+    client = _epoch_app_with_routes(epoch_app)
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=5), sub="u1")
+    _set_epoch(timedelta(seconds=5))
+    for path in ["/health", "/maybe", "/protected"]:
+        resp = client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert _renewed_token_from(resp) is None, path
+    assert client.get("/maybe", headers={"Authorization": f"Bearer {token}"}).json() == {
+        "user_id": None
+    }
+
+
+def test_suspended_user_not_renewed(epoch_app):
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    client = _epoch_app_with_routes(epoch_app)
+    s = SessionLocal()
+    try:
+        s.get(UserRow, "u1").approved = False
+        s.commit()
+    finally:
+        s.close()
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=5), sub="u1")
+    resp = client.get("/maybe", headers={"Authorization": f"Bearer {token}"})
+    assert _renewed_token_from(resp) is None
+
+
+@pytest.mark.parametrize("path", ["/protected", "/maybe"])
+def test_valid_token_renewed_on_authenticated_routes(epoch_app, path):
+    client = _epoch_app_with_routes(epoch_app)
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=5), sub="u1")
+    resp = client.get(path, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    renewed = _renewed_token_from(resp)
+    assert renewed and renewed != token
+    # And the successor works.
+    assert client.get("/protected", headers={"Authorization": f"Bearer {renewed}"}).status_code == 200
+
+
+def test_valid_token_not_renewed_on_public_route(epoch_app):
+    client = _epoch_app_with_routes(epoch_app)
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=5), sub="u1")
+    resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
+    assert _renewed_token_from(resp) is None

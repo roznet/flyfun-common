@@ -114,13 +114,13 @@ app.add_middleware(SlidingSessionMiddleware)
 ```
 
 Behavior:
-- On each HTTP request, decodes the `flyfun_auth` cookie. If the remaining lifetime is below `JWT_REFRESH_THRESHOLD_DAYS` (default 15), mints a fresh JWT and attaches it as a new `Set-Cookie` on the response.
-- Users who visit at least once every ~15 days stay logged in indefinitely; users silent for the full `JWT_EXPIRY_DAYS` window (default 30) are forced to re-login.
-- Bearer-token requests (JWT or `ff_` API tokens) are never refreshed — there's no cookie to rewrite.
-- Expired or malformed cookies are passed through unchanged (the auth dependency will 401).
-- If the endpoint already sets `flyfun_auth` (login callback, logout, account delete), the middleware skips to avoid clobbering.
+- Reads the session JWT from the `flyfun_auth` cookie, or else from `Authorization: Bearer <jwt>`. If its remaining lifetime is below `JWT_REFRESH_THRESHOLD_DAYS` (default 15), it mints a successor: `Set-Cookie` for the cookie, `X-Renewed-Token` for Bearer (native apps store it). `ff_` API tokens are never renewed.
+- **Only requests that authenticated with that token renew it.** `current_user_id` / `optional_user_id` call `mark_session_authenticated(request, user_id)` once every check has passed (user exists, approved, `iat` not before `tokens_valid_after`). The middleware renews only if the marked user is the token's `sub`, and only on a response below 400. Public routes (`/health`, `/privacy`, ...) never renew. Without this, a token revoked by "log out everywhere" could be reissued with a fresh `iat` on a public route and pass the epoch check again (fixed in 0.6.9). A route with its own auth should call `mark_session_authenticated` if it wants renewal.
+- Users who make an authenticated request at least once every ~15 days stay logged in indefinitely; users silent for the full `JWT_EXPIRY_DAYS` window (default 30) must sign in again.
+- Expired or malformed tokens are passed through unchanged (the auth dependency will 401).
+- If the endpoint already sets `flyfun_auth` or `X-Renewed-Token` (login callback, logout, account delete), the middleware skips to avoid clobbering.
 - Refreshing reissues a JWT with the same `sub`/`email`/`name` claims, new `iat`/`exp`, same HS256 secret. No refresh-token plumbing, no server-side denylist.
-- Admin suspension still takes effect immediately because `current_user_id` re-checks `user.approved` on every request regardless of token lifetime.
+- Suspension and "log out everywhere" take effect immediately, because the dependencies re-check `approved` and the revocation epoch on every request, and a rejected request is never renewed.
 
 ## Usage Examples
 
