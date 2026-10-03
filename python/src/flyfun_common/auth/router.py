@@ -49,6 +49,7 @@ from flyfun_common.oauth.models import (
     OAuthAuthorizationCodeRow,
     OAuthRefreshTokenRow,
 )
+from flyfun_common.oauth.pkce import verify_pkce_s256
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,8 @@ _apple_jwks_client: pyjwt.PyJWKClient | None = None
 
 # Client-generated OAuth `state` nonce: opaque, URL-safe, bounded length.
 _OAUTH_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+# S256 challenge: base64url (no padding) of a SHA-256 digest.
+_PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 def _is_safe_relative_path(value: str) -> bool:
@@ -199,6 +202,8 @@ class ExchangeCodeRequest(BaseModel):
 
     code: str
     state: str | None = None
+    # PKCE (RFC 7636): required when /auth/login was given a code_challenge.
+    code_verifier: str | None = None
 
 
 def create_auth_router(
@@ -252,6 +257,8 @@ def create_auth_router(
         scheme: str | None = None,
         state: str | None = None,
         next: str | None = None,
+        code_challenge: str | None = None,
+        code_challenge_method: str | None = None,
     ):
         if provider not in SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
@@ -264,6 +271,19 @@ def create_auth_router(
                 raise HTTPException(status_code=400, detail="Invalid URL scheme")
         if state is not None and not _OAUTH_STATE_RE.fullmatch(state):
             raise HTTPException(status_code=400, detail="Invalid state")
+        if platform == "ios" and (not scheme or not state):
+            # Native sign-in is the auth-code flow only: the app names its
+            # (allowlisted) scheme and sends a `state` nonce. The old branch
+            # that put the session JWT itself in the callback URL is gone.
+            raise HTTPException(
+                status_code=400,
+                detail="Native sign-in needs scheme and state; please update the app",
+            )
+        if code_challenge is not None and (
+            code_challenge_method != "S256"
+            or not _PKCE_CHALLENGE_RE.fullmatch(code_challenge)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid code_challenge")
 
         client = _get_oauth_client(provider)
         redirect_uri = request.url_for("callback", provider=provider)
@@ -278,6 +298,12 @@ def create_auth_router(
         # can't authenticate a victim (login-CSRF).
         if state:
             request.session["oauth_state"] = state
+        # PKCE for the native flow: bound into the exchange code so only the
+        # app holding the verifier can redeem it. Always reset, so a challenge
+        # left from an abandoned sign-in never applies to the next one.
+        request.session.pop("oauth_code_challenge", None)
+        if platform == "ios" and code_challenge:
+            request.session["oauth_code_challenge"] = code_challenge
         # Post-login redirect — honored only on browser/web flow, not native iOS.
         # Silently dropped if it doesn't pass open-redirect validation.
         if next and platform != "ios" and _is_safe_relative_path(next):
@@ -337,31 +363,24 @@ def create_auth_router(
         # iOS flow doesn't honor post-login redirect — the app owns navigation.
         post_login_redirect = request.session.pop("post_login_redirect", None)
         if platform == "ios":
-            # `scheme` was validated against the allowlist at /auth/login; the
-            # "flyfun" default is only a fallback for a native login that passed
-            # no scheme.
-            scheme = request.session.pop("oauth_scheme", "flyfun")
-            state = request.session.pop("oauth_state", "")
-            if state:
-                # New client — it signals code-flow capability by sending a
-                # `state`. Auth-code flow: hand back a short-TTL signed CODE
-                # bound to `state`, never the session JWT. The app POSTs it to
-                # /auth/exchange over HTTPS. Keeps the bearer token out of
-                # URLs/logs and closes the login-CSRF vector.
-                code = create_exchange_code(user.id, state, get_jwt_secret())
-                redirect_url = (
-                    f"{scheme}://auth/callback?code={quote(code)}&state={quote(state)}"
+            # Auth-code flow: hand back a short-TTL signed CODE bound to `state`
+            # (and to the PKCE challenge when the app sent one), never the
+            # session JWT. The app POSTs it to /auth/exchange over HTTPS.
+            # /auth/login refused a native sign-in without an allowlisted
+            # scheme and a state; re-check in case the session lost them.
+            scheme = request.session.pop("oauth_scheme", None)
+            state = request.session.pop("oauth_state", None)
+            code_challenge = request.session.pop("oauth_code_challenge", None)
+            if not scheme or not state:
+                raise HTTPException(
+                    status_code=400, detail="Sign-in was not started by the app"
                 )
-            else:
-                # Legacy client (no `state`) — keep the old token param so
-                # not-yet-updated builds of consuming apps (this is shared
-                # multi-app code) still sign in. Migrated clients never hit this
-                # branch, so they never get a token in the URL. Remove once
-                # every consuming app sends `state`.
-                legacy_token = create_token(
-                    user.id, user.email, user.display_name, get_jwt_secret()
-                )
-                redirect_url = f"{scheme}://auth/callback?token={quote(legacy_token)}"
+            code = create_exchange_code(
+                user.id, state, get_jwt_secret(), code_challenge=code_challenge
+            )
+            redirect_url = (
+                f"{scheme}://auth/callback?code={quote(code)}&state={quote(state)}"
+            )
             return RedirectResponse(url=redirect_url, status_code=302)
 
         jwt_token = create_token(
@@ -403,6 +422,14 @@ def create_auth_router(
         # it's an anti-injection nonce), but the match must be exact.
         if claims.get("state", "") != (body.state or ""):
             raise HTTPException(status_code=400, detail="State mismatch")
+
+        # PKCE: a code minted for a sign-in that sent a challenge is useless
+        # without the verifier, so an intercepted callback can't be redeemed.
+        challenge = claims.get("cc")
+        if challenge and not (
+            body.code_verifier and verify_pkce_s256(body.code_verifier, challenge)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid code verifier")
 
         user = db.get(UserRow, claims.get("uid"))
         if user is None:

@@ -188,3 +188,97 @@ def test_login_rejects_unknown_scheme(tmp_path):
         from flyfun_common.db.engine import reset_engine
 
         reset_engine()
+
+
+# --- PKCE (RFC 7636) on the native flow ---------------------------------------
+
+
+def _pkce_pair():
+    import hashlib
+    import secrets
+    from base64 import urlsafe_b64encode
+
+    verifier = secrets.token_urlsafe(48)
+    challenge = (
+        urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    return verifier, challenge
+
+
+@pytest.mark.parametrize(
+    "verifier_kind, expected",
+    [("right", 200), ("wrong", 400), ("missing", 400)],
+)
+def test_exchange_requires_verifier_when_code_has_challenge(tmp_path, verifier_kind, expected):
+    """A code bound to a challenge can only be redeemed with its verifier, so
+    an app that intercepts the callback (code + state) gets nothing."""
+    from flyfun_common.auth.config import get_jwt_secret
+    from flyfun_common.auth.jwt_utils import create_exchange_code
+
+    app, client, session = _fresh_app(tmp_path)
+    try:
+        verifier, challenge = _pkce_pair()
+        code = create_exchange_code(
+            "dev-user-001", "state-1", get_jwt_secret(), code_challenge=challenge
+        )
+        body = {"code": code, "state": "state-1"}
+        if verifier_kind == "right":
+            body["code_verifier"] = verifier
+        elif verifier_kind == "wrong":
+            body["code_verifier"] = _pkce_pair()[0]
+        resp = client.post("/auth/exchange", json=body)
+        assert resp.status_code == expected
+        if expected != 200:
+            assert "token" not in resp.json()
+    finally:
+        session.close()
+        from flyfun_common.db.engine import reset_engine
+
+        reset_engine()
+
+
+def test_exchange_without_challenge_ignores_verifier(tmp_path):
+    """Clients that never sent a challenge keep working unchanged."""
+    from flyfun_common.auth.config import get_jwt_secret
+    from flyfun_common.auth.jwt_utils import create_exchange_code
+
+    app, client, session = _fresh_app(tmp_path)
+    try:
+        code = create_exchange_code("dev-user-001", "state-1", get_jwt_secret())
+        resp = client.post(
+            "/auth/exchange",
+            json={"code": code, "state": "state-1", "code_verifier": _pkce_pair()[0]},
+        )
+        assert resp.status_code == 200
+    finally:
+        session.close()
+        from flyfun_common.db.engine import reset_engine
+
+        reset_engine()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"code_challenge": "x" * 43},  # method missing (RFC default "plain")
+        {"code_challenge": "x" * 43, "code_challenge_method": "plain"},
+        {"code_challenge": "too-short", "code_challenge_method": "S256"},
+        {"code_challenge": "x" * 42 + "!", "code_challenge_method": "S256"},
+    ],
+)
+def test_login_rejects_bad_code_challenge(tmp_path, params):
+    app, client, session = _fresh_app(tmp_path)
+    try:
+        resp = client.get(
+            "/auth/login/google",
+            params={"platform": "ios", "scheme": "flyfunforms", "state": "state-123", **params},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 400
+    finally:
+        session.close()
+        from flyfun_common.db.engine import reset_engine
+
+        reset_engine()

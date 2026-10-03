@@ -368,38 +368,62 @@ def test_callback_drops_absolute_next(callback_app):
 
 
 def test_callback_ios_with_state_emits_code(callback_app):
-    """New client (sends `state`) → auth-code flow: custom scheme with a
+    """Native sign-in (scheme + `state`) → auth-code flow: custom scheme with a
     code+state, never a token, and it ignores `next`."""
     app, _ = callback_app
     client = TestClient(app)
     client.get(
         "/auth/login/google",
-        params={"platform": "ios", "state": "teststate123", "next": "/path"},
+        params={
+            "platform": "ios",
+            "scheme": "flyfunforms",
+            "state": "teststate123",
+            "next": "/path",
+        },
         follow_redirects=False,
     )
     r2 = client.get("/auth/callback/google", follow_redirects=False)
     assert r2.status_code == 302
     loc = r2.headers["location"]
-    assert loc.startswith("flyfun://auth/callback?code=")
+    assert loc.startswith("flyfunforms://auth/callback?code=")
     assert "state=teststate123" in loc
-    assert "token=" not in loc  # migrated clients never get a token in the URL
+    assert "token=" not in loc  # the session JWT never travels in a URL
 
 
-def test_callback_ios_legacy_no_state_emits_token(callback_app):
-    """Legacy client (no `state`) → backward-compat token param so
-    not-yet-updated builds still sign in."""
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"platform": "ios", "scheme": "flyfunforms"},  # no state (legacy client)
+        {"platform": "ios", "state": "teststate123"},  # no scheme
+        {"platform": "ios"},
+    ],
+)
+def test_login_native_without_scheme_and_state_rejected(callback_app, params):
+    """The legacy branch that returned the session JWT in the custom-scheme
+    URL is gone: a native sign-in must name its scheme and send a state."""
     app, _ = callback_app
     client = TestClient(app)
-    client.get(
-        "/auth/login/google",
-        params={"platform": "ios", "next": "/path"},
-        follow_redirects=False,
-    )
+    r1 = client.get("/auth/login/google", params=params, follow_redirects=False)
+    assert r1.status_code == 400
+
+
+def test_callback_native_without_session_values_rejected(callback_app):
+    """If the session lost scheme/state between login and callback, the
+    callback refuses rather than falling back to a default scheme."""
+    from starlette.requests import Request
+
+    app, _ = callback_app
+
+    @app.get("/test/mark-native")
+    def mark_native(request: Request):
+        request.session["oauth_platform"] = "ios"
+        return {}
+
+    client = TestClient(app)
+    client.get("/test/mark-native")
     r2 = client.get("/auth/callback/google", follow_redirects=False)
-    assert r2.status_code == 302
-    loc = r2.headers["location"]
-    assert loc.startswith("flyfun://auth/callback?token=")
-    assert "code=" not in loc
+    assert r2.status_code == 400
+    assert "token=" not in r2.headers.get("location", "")
 
 
 def test_callback_no_next_redirects_home(callback_app):
@@ -643,3 +667,61 @@ def test_valid_token_not_renewed_on_public_route(epoch_app):
     token = _forge_token("epoch-secret", exp_in=timedelta(days=5), sub="u1")
     resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
     assert _renewed_token_from(resp) is None
+
+
+def test_native_pkce_end_to_end(callback_app):
+    """login(code_challenge) -> callback code -> exchange needs the verifier."""
+    import hashlib
+    import secrets
+    from base64 import urlsafe_b64encode
+    from urllib.parse import parse_qs, urlparse
+
+    app, _ = callback_app
+    client = TestClient(app)
+    verifier = secrets.token_urlsafe(48)
+    challenge = (
+        urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    client.get(
+        "/auth/login/google",
+        params={
+            "platform": "ios",
+            "scheme": "flyfunforms",
+            "state": "teststate123",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    loc = client.get("/auth/callback/google", follow_redirects=False).headers["location"]
+    q = parse_qs(urlparse(loc).query)
+    code, state = q["code"][0], q["state"][0]
+
+    # What an intercepting app holds: code + state, no verifier.
+    assert client.post("/auth/exchange", json={"code": code, "state": state}).status_code == 400
+    ok = client.post(
+        "/auth/exchange", json={"code": code, "state": state, "code_verifier": verifier}
+    )
+    assert ok.status_code == 200 and ok.json()["token"]
+
+
+def test_stale_challenge_not_applied_to_next_signin(callback_app):
+    """A challenge from an abandoned sign-in must not bind the next one."""
+    from urllib.parse import parse_qs, urlparse
+
+    app, _ = callback_app
+    client = TestClient(app)
+    base = {"platform": "ios", "scheme": "flyfunforms", "state": "teststate123"}
+    client.get(
+        "/auth/login/google",
+        params={**base, "code_challenge": "A" * 43, "code_challenge_method": "S256"},
+        follow_redirects=False,
+    )
+    # Abandoned; a new sign-in from a client without PKCE.
+    client.get("/auth/login/google", params=base, follow_redirects=False)
+    loc = client.get("/auth/callback/google", follow_redirects=False).headers["location"]
+    q = parse_qs(urlparse(loc).query)
+    resp = client.post("/auth/exchange", json={"code": q["code"][0], "state": q["state"][0]})
+    assert resp.status_code == 200
