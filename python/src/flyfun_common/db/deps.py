@@ -61,9 +61,10 @@ _BROAD_SCOPES: set[str] = {"mcp"}
 def register_broad_scope(scope: str) -> None:
     """Mark ``scope`` as broad: a token carrying it has full access.
 
-    ``mcp`` is broad by default (the claude.ai/Cowork connector scope). Broad
-    applies in every app that shares the token table, so only use it for
-    scopes whose consent screen already promises full account access.
+    ``mcp`` is broad by default (the claude.ai/Cowork connector scope). The
+    registry is per process, like the scope allowlist: broad applies only in
+    the app that registers it. Only use it for scopes whose consent screen
+    already promises full account access.
     """
     _BROAD_SCOPES.add(scope)
 

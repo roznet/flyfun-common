@@ -63,6 +63,16 @@ _OAUTH_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
+# Per-sign-in session keys set by /auth/login and consumed by the callback.
+_LOGIN_SESSION_KEYS = (
+    "oauth_platform",
+    "oauth_scheme",
+    "oauth_state",
+    "oauth_code_challenge",
+    "post_login_redirect",
+)
+
+
 def _is_safe_relative_path(value: str) -> bool:
     """True if `value` is a safe same-origin redirect target.
 
@@ -289,6 +299,12 @@ def create_auth_router(
         redirect_uri = request.url_for("callback", provider=provider)
         if not is_dev_mode():
             redirect_uri = str(redirect_uri).replace("http://", "https://")
+        # Every sign-in starts from a clean slate: keys left by an abandoned
+        # one (e.g. a native sign-in started in an Android Custom Tab, which
+        # shares the browser's cookie jar) must never steer the next one, or a
+        # later web sign-in would be sent to the app's scheme.
+        for key in _LOGIN_SESSION_KEYS:
+            request.session.pop(key, None)
         if platform:
             request.session["oauth_platform"] = platform
         if scheme:
@@ -299,9 +315,7 @@ def create_auth_router(
         if state:
             request.session["oauth_state"] = state
         # PKCE for the native flow: bound into the exchange code so only the
-        # app holding the verifier can redeem it. Always reset, so a challenge
-        # left from an abandoned sign-in never applies to the next one.
-        request.session.pop("oauth_code_challenge", None)
+        # app holding the verifier can redeem it.
         if platform == "ios" and code_challenge:
             request.session["oauth_code_challenge"] = code_challenge
         # Post-login redirect — honored only on browser/web flow, not native iOS.

@@ -725,3 +725,20 @@ def test_stale_challenge_not_applied_to_next_signin(callback_app):
     q = parse_qs(urlparse(loc).query)
     resp = client.post("/auth/exchange", json={"code": q["code"][0], "state": q["state"][0]})
     assert resp.status_code == 200
+
+
+def test_abandoned_native_signin_does_not_steer_web_signin(callback_app):
+    """An abandoned app sign-in (Android Custom Tabs share the browser's
+    cookies) must not send a later web sign-in to the app's scheme."""
+    app, _ = callback_app
+    client = TestClient(app)
+    client.get(
+        "/auth/login/google",
+        params={"platform": "ios", "scheme": "flyfunforms", "state": "teststate123"},
+        follow_redirects=False,
+    )
+    # Abandoned; the user now signs in on the website in the same browser.
+    client.get("/auth/login/google", follow_redirects=False)
+    loc = client.get("/auth/callback/google", follow_redirects=False).headers["location"]
+    assert not loc.startswith("flyfunforms:")
+    assert "code=" not in loc
