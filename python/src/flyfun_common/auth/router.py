@@ -41,7 +41,7 @@ from flyfun_common.auth.jwt_utils import (
     decode_exchange_code,
     get_jwt_cookie_max_age,
 )
-from flyfun_common.auth.magic_link import _normalize_email, _users_with_email
+from flyfun_common.auth.users import normalize_email, users_with_email
 from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
 # Imported from the models module rather than the ``oauth`` package: the
@@ -193,7 +193,7 @@ def _user_to_link_by_email(
     ``link_email`` comes from ``_linkable_email``: the provider vouches that
     the signer controls that mailbox, the same proof a magic link gives.
     Matching is the magic-link lookup (case-insensitive, exact otherwise;
-    exact-case then oldest row first).
+    same order, so both sign-ins land on the same row).
 
     A row from the *same* provider under a different subject is skipped:
     that is a deleted-and-recreated account or a reassigned address, i.e.
@@ -204,7 +204,7 @@ def _user_to_link_by_email(
     return next(
         (
             u
-            for u in _users_with_email(db, _normalize_email(link_email))
+            for u in users_with_email(db, normalize_email(link_email))
             if u.provider != provider
         ),
         None,

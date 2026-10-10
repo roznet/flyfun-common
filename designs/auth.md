@@ -17,6 +17,7 @@ auth/
 ├── middleware.py  # SlidingSessionMiddleware — rolling cookie refresh
 ├── router.py      # create_auth_router() → FastAPI APIRouter
 ├── magic_link.py  # email magic-link + OTP sub-router & helpers
+├── users.py       # email-keyed user lookup shared by magic-link and OAuth linking
 └── rate_limit.py  # DB-backed sliding-window limits for magic-link
 ```
 
@@ -79,11 +80,11 @@ Endpoints (all prefixed `/auth`):
 
 Account-linking rule: `_find_or_create_user_by_email` looks up by lowercased email. Existing rows keep their original `provider` (a Google user verifying via magic-link stays `provider="google"`). New rows are created with `provider="email"`, `provider_sub=<email>`, `approved=True`.
 
-The OAuth side links too, more strictly: `_find_or_create_user` falls back to `_users_with_email` when `(provider, provider_sub)` has no row, so a magic-link user who later taps "Sign in with Google" lands on the same account instead of a new empty one.
+The OAuth side links too, more strictly: `_find_or_create_user` falls back to `auth.users.users_with_email` (the lookup magic-link uses) when `(provider, provider_sub)` has no row, so a magic-link user who later taps "Sign in with Google" lands on the same account instead of a new empty one.
 
 - **Only on a provider-authoritative email** (`_linkable_email`). A provider's `email_verified` means "verified once", not "controls the mailbox now". A consumer Google/Apple ID on an address since reassigned (left the company, lapsed domain) would otherwise land on the new owner's magic-link account. So linking requires an explicit `email_verified` true *and* a mailbox the provider hosts: Google for `gmail.com`/`googlemail.com` or a Workspace account whose `hd` claim equals the domain; Apple for `icloud.com`/`me.com`/`mac.com`. ASCII only (no Unicode case-folding onto an ASCII row). Other domains still sign in, just as a separate account (e.g. an Apple ID on a yahoo/gmx/company address does not join that address's magic-link or Google account; merge by hand). This is deliberately stricter than `_email_if_verified`, which decides only what email is *stored*, and treats a missing claim as verified.
 - **Never onto a row of the same provider** with a different sub (recreated account, recycled Workspace address). The guard is partial: the same "maybe another person" applies across providers, which is what the authoritative-domain rule covers.
-- **Deterministic among duplicates:** exact-case first, then oldest `created_at`. Magic-link uses the same order.
+- **Deterministic among duplicates:** exact-case first, then by `id`, the order magic-link has always picked in (on MySQL a `LOWER(email)` lookup is a full scan in primary-key order). Both sign-in paths use it, so they land on the same row. Not "oldest first": that would move magic-link users who have duplicate accounts onto a different account.
 - **No identities table.** The matched row keeps its own `provider`/`provider_sub`; the new provider is re-found by email on every sign-in. If either side's email later changes (Google/Apple rewrite `users.email` on a returning sign-in), the other provider's next sign-in creates a new empty account. Merge by hand.
 - **Approval carries over:** a suspended row 403s a newly linked provider too; `on_new_user` does not fire for a linked sign-in.
 - Apple "Hide My Email" relay addresses never link. Those sign-ins create a separate account; merge by hand.

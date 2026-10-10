@@ -449,7 +449,7 @@ def test_lookup_rechecks_matches_the_database_folds(dev_env):
     """Even when the database says `gmäil.com` = `gmail.com` (as MySQL's
     accent-insensitive collation does), the account is not picked. Requests
     are ASCII-only, so the folded row is the stored, accented one."""
-    from flyfun_common.auth.magic_link import _user_with_email
+    from flyfun_common.auth.users import user_with_email as _user_with_email
     from flyfun_common.db.engine import SessionLocal
 
     _seed_google_user("accented", "Victim@gm\u00e4il.com")
@@ -466,7 +466,7 @@ def test_lookup_rechecks_matches_the_database_folds(dev_env):
 
 
 def test_lookup_prefers_exact_case_row(dev_env):
-    from flyfun_common.auth.magic_link import _user_with_email
+    from flyfun_common.auth.users import user_with_email as _user_with_email
     from flyfun_common.db.engine import SessionLocal
 
     _seed_google_user("mixed", "Dana@Example.com")
