@@ -37,7 +37,6 @@ from urllib.parse import urlencode, urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import (
@@ -46,6 +45,7 @@ from flyfun_common.auth.config import (
     is_dev_mode,
 )
 from flyfun_common.auth.jwt_utils import create_token
+from flyfun_common.auth.users import normalize_email, user_with_email
 from flyfun_common.auth.rate_limit import (
     check_email_request_rate,
     check_ip_consume_rate,
@@ -95,10 +95,6 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _normalize_email(email: str) -> str:
-    return email.strip().lower()
-
-
 def _is_safe_relative_path(value: str | None) -> bool:
     """Mirror of router._is_safe_relative_path, duplicated to avoid an
     import cycle (magic_link is imported from router)."""
@@ -146,33 +142,6 @@ def _build_verify_link(request: Request, token: str, next_path: str | None) -> s
     return f"{base}?{urlencode(params)}"
 
 
-def _users_with_email(db: Session, email_lower: str) -> list[UserRow]:
-    """Every user whose stored email equals ``email_lower`` ignoring case only.
-
-    SQL narrows the candidates; Python decides. The database comparison
-    depends on its collation (MySQL's ``utf8mb4_unicode_ci`` also ignores
-    accents and folds ``ß``/``ss``, so ``gmäil.com`` = ``gmail.com``), and
-    LIKE would add wildcards. Neither may pick the account. Rows stored with
-    mixed case (OAuth providers' emails are kept as given) still match.
-
-    Order is deterministic, since several rows can share an email: exact-case
-    rows first, then oldest first.
-    """
-    candidates = (
-        db.query(UserRow)
-        .filter(func.lower(UserRow.email) == email_lower)
-        .order_by(UserRow.created_at, UserRow.id)
-        .all()
-    )
-    matches = [u for u in candidates if _normalize_email(u.email or "") == email_lower]
-    return sorted(matches, key=lambda u: u.email != email_lower)  # stable
-
-
-def _user_with_email(db: Session, email_lower: str) -> UserRow | None:
-    """The first of ``_users_with_email``: the account an email signs in to."""
-    return next(iter(_users_with_email(db, email_lower)), None)
-
-
 def _find_or_create_user_by_email(
     db: Session,
     email: str,
@@ -183,13 +152,13 @@ def _find_or_create_user_by_email(
     """Locate a user by email or create one with ``provider='email'``.
 
     The magic-link side of account linking; ``router._find_or_create_user``
-    is the OAuth side (it falls back to this module's ``_users_with_email``).
+    is the OAuth side; both look users up through ``auth.users``.
     Email-keyed lookup is case-insensitive. When an existing row is found,
     its ``provider`` field is preserved (a Google user verifying via
     magic-link stays ``provider='google'``).
     """
-    email_lower = _normalize_email(email)
-    user = _user_with_email(db, email_lower)
+    email_lower = normalize_email(email)
+    user = user_with_email(db, email_lower)
 
     if user is None:
         user = UserRow(
@@ -306,7 +275,7 @@ def build_magic_link_router(
                 detail="Magic-link sign-in is not configured on this server",
             )
 
-        email_lower = _normalize_email(body.email)
+        email_lower = normalize_email(body.email)
 
         if email_lower.endswith(APPLE_PRIVATE_RELAY_SUFFIX):
             raise HTTPException(
@@ -438,7 +407,7 @@ def build_magic_link_router(
         if not check_ip_consume_rate(db, ip):
             raise HTTPException(status_code=429, detail="Too many attempts")
 
-        email_lower = _normalize_email(body.email)
+        email_lower = normalize_email(body.email)
         code_hash = _sha256(body.code.strip())
         now = _now()
 
@@ -456,7 +425,7 @@ def build_magic_link_router(
             .order_by(MagicLinkTokenRow.created_at.desc())
             .all()
         )
-        # Same collation caveat as _user_with_email: keep exact matches only.
+        # Same collation caveat as users.user_with_email: keep exact matches only.
         candidates = [r for r in candidates if r.email == email_lower]
         match = next(
             (

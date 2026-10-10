@@ -180,21 +180,37 @@ def test_same_provider_different_sub_is_not_linked(db):
     assert len(_all_users(db)) == 2
 
 
-def test_duplicates_link_to_oldest_other_provider_row(db):
-    """Rows sharing an email (pre-linking duplicates): skip the same
-    provider, then oldest first, whatever order the database returns."""
+def _set_created(db, days: dict) -> None:
     from datetime import datetime, timezone
     from flyfun_common.db.models import UserRow
 
-    _add_user(db, "a-newer-email", "email", "pilot@gmail.com", "pilot@gmail.com")
-    _add_user(db, "b-google-old", "google", "g-old", "pilot@gmail.com")
-    _add_user(db, "c-older-apple", "apple", "a-1", "pilot@gmail.com")
-    times = {"a-newer-email": 3, "b-google-old": 1, "c-older-apple": 2}
-    for uid, day in times.items():
+    for uid, day in days.items():
         db.get(UserRow, uid).created_at = datetime(2026, 1, day, tzinfo=timezone.utc)
     db.commit()
 
-    assert _sign_in(db, "google", "g-new", "pilot@gmail.com").id == "c-older-apple"
+
+def test_duplicates_link_in_magic_link_order(db):
+    """Rows sharing an email (pre-linking duplicates): skip the same
+    provider, then the row magic-link would pick (by id, not by age)."""
+    _add_user(db, "a-google-old", "google", "g-old", "pilot@gmail.com")
+    _add_user(db, "b-email", "email", "pilot@gmail.com", "pilot@gmail.com")
+    _add_user(db, "c-apple", "apple", "a-1", "pilot@gmail.com")
+    _set_created(db, {"a-google-old": 2, "b-email": 3, "c-apple": 1})
+
+    assert _sign_in(db, "google", "g-new", "pilot@gmail.com").id == "b-email"
+
+
+def test_magic_link_pick_is_by_id_not_age(db):
+    """The magic-link account choice among duplicates is unchanged by the
+    explicit ordering: exact-case first, then id (MySQL's scan order)."""
+    from flyfun_common.auth.users import user_with_email as _user_with_email
+
+    _add_user(db, "a-newer", "google", "g-1", "pilot@gmail.com")
+    _add_user(db, "b-older", "email", "pilot@gmail.com", "pilot@gmail.com")
+    _add_user(db, "0-mixed-case", "apple", "a-1", "Pilot@gmail.com")
+    _set_created(db, {"a-newer": 9, "b-older": 1, "0-mixed-case": 1})
+
+    assert _user_with_email(db, "pilot@gmail.com").id == "a-newer"
 
 
 def test_no_email_never_links(db):
@@ -289,3 +305,55 @@ def test_native_apple_token_linked_suspended_user_is_refused(db, monkeypatch):
     assert resp.status_code == 403
     db.expire_all()
     assert len(_all_users(db)) == 1
+
+
+# --- End to end through the web callback (the Google path) -------------------
+
+
+@pytest.fixture
+def google_callback(db, monkeypatch):
+    """Drive /auth/login/google + /auth/callback/google with a stub provider
+    returning ``userinfo``; return the signed-in user id."""
+    from flyfun_common.auth import router as router_mod
+    from flyfun_common.auth.config import COOKIE_NAME, get_jwt_secret
+    from flyfun_common.auth.jwt_utils import decode_token
+    from tests.test_sliding_session import _StubOAuth, _StubOAuthClient
+
+    def sign_in(userinfo: dict) -> str:
+        monkeypatch.setattr(
+            router_mod, "create_oauth", lambda: _StubOAuth(_StubOAuthClient(userinfo))
+        )
+        app = FastAPI()
+        app.add_middleware(SessionMiddleware, secret_key="test")
+        app.include_router(router_mod.create_auth_router())
+        client = TestClient(app)
+        assert client.get("/auth/login/google", follow_redirects=False).status_code == 302
+        r = client.get("/auth/callback/google", follow_redirects=False)
+        assert r.status_code == 302, r.text
+        token = r.cookies.get(COOKIE_NAME) or client.cookies.get(COOKIE_NAME)
+        return decode_token(token, get_jwt_secret())["sub"]
+
+    return sign_in
+
+
+def test_google_callback_links_to_magic_link_account(db, google_callback):
+    _add_user(db, "u-email", "email", "pilot@gmail.com", "pilot@gmail.com")
+
+    user_id = google_callback(
+        {"sub": "g-1", "email": "pilot@gmail.com", "email_verified": True,
+         "name": "Pilot Name"}
+    )
+
+    assert user_id == "u-email"
+    db.expire_all()
+    assert len(_all_users(db)) == 1
+
+
+def test_google_callback_without_verified_claim_does_not_link(db, google_callback):
+    _add_user(db, "u-email", "email", "pilot@gmail.com", "pilot@gmail.com")
+
+    user_id = google_callback({"sub": "g-1", "email": "pilot@gmail.com", "name": "P"})
+
+    assert user_id != "u-email"
+    db.expire_all()
+    assert len(_all_users(db)) == 2
