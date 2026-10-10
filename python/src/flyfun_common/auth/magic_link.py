@@ -146,25 +146,31 @@ def _build_verify_link(request: Request, token: str, next_path: str | None) -> s
     return f"{base}?{urlencode(params)}"
 
 
-def _user_with_email(db: Session, email_lower: str) -> UserRow | None:
-    """The user whose stored email equals ``email_lower`` ignoring case only.
+def _users_with_email(db: Session, email_lower: str) -> list[UserRow]:
+    """Every user whose stored email equals ``email_lower`` ignoring case only.
 
     SQL narrows the candidates; Python decides. The database comparison
     depends on its collation (MySQL's ``utf8mb4_unicode_ci`` also ignores
     accents and folds ``ß``/``ss``, so ``gmäil.com`` = ``gmail.com``), and
     LIKE would add wildcards. Neither may pick the account. Rows stored with
-    mixed case (OAuth providers' emails are kept as given) still match; an
-    exact-case row wins over those.
+    mixed case (OAuth providers' emails are kept as given) still match.
+
+    Order is deterministic, since several rows can share an email: exact-case
+    rows first, then oldest first.
     """
     candidates = (
         db.query(UserRow)
         .filter(func.lower(UserRow.email) == email_lower)
+        .order_by(UserRow.created_at, UserRow.id)
         .all()
     )
     matches = [u for u in candidates if _normalize_email(u.email or "") == email_lower]
-    return next((u for u in matches if u.email == email_lower), None) or next(
-        iter(matches), None
-    )
+    return sorted(matches, key=lambda u: u.email != email_lower)  # stable
+
+
+def _user_with_email(db: Session, email_lower: str) -> UserRow | None:
+    """The first of ``_users_with_email``: the account an email signs in to."""
+    return next(iter(_users_with_email(db, email_lower)), None)
 
 
 def _find_or_create_user_by_email(
@@ -176,11 +182,11 @@ def _find_or_create_user_by_email(
 ) -> UserRow:
     """Locate a user by email or create one with ``provider='email'``.
 
-    Does not mutate the existing ``_find_or_create_user`` -- Google/Apple's
-    ``(provider, provider_sub)`` path is left alone. Email-keyed lookup is
-    case-insensitive. When an existing row is found, its ``provider`` field
-    is preserved (a Google user verifying via magic-link stays
-    ``provider='google'``).
+    The magic-link side of account linking; ``router._find_or_create_user``
+    is the OAuth side (it falls back to this module's ``_users_with_email``).
+    Email-keyed lookup is case-insensitive. When an existing row is found,
+    its ``provider`` field is preserved (a Google user verifying via
+    magic-link stays ``provider='google'``).
     """
     email_lower = _normalize_email(email)
     user = _user_with_email(db, email_lower)

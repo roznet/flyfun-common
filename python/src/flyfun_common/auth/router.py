@@ -41,6 +41,7 @@ from flyfun_common.auth.jwt_utils import (
     decode_exchange_code,
     get_jwt_cookie_max_age,
 )
+from flyfun_common.auth.magic_link import _normalize_email, _users_with_email
 from flyfun_common.db.deps import current_user_id, get_db
 from flyfun_common.db.models import ApiTokenRow, UserPreferencesRow, UserRow
 # Imported from the models module rather than the ``oauth`` package: the
@@ -150,6 +151,66 @@ def _extract_userinfo(provider: str, token: dict) -> tuple[str, str, str]:
     return userinfo["sub"], email, userinfo.get("name", "")
 
 
+# Domains whose mailboxes the provider itself hosts. Only there does the
+# provider's ``email_verified`` mean "controls this mailbox now": elsewhere it
+# means "verified once", and a since-reassigned address (left the company,
+# lapsed domain) would hand the new owner's account to the old one.
+_GOOGLE_HOSTED_DOMAINS = frozenset({"gmail.com", "googlemail.com"})
+_APPLE_HOSTED_DOMAINS = frozenset({"icloud.com", "me.com", "mac.com"})
+
+
+def _linkable_email(provider: str, claims: dict, email: str) -> str:
+    """``email`` if this sign-in may join an existing account by it, else "".
+
+    Stricter than ``_email_if_verified`` (which decides what we *store*):
+    - ``email_verified`` must be present and true; missing is not enough.
+    - The provider must be authoritative for the address: Google for
+      gmail.com / googlemail.com or any Workspace account (``hd`` claim, the
+      domain is managed by Google); Apple for icloud.com / me.com / mac.com.
+    - ASCII only, so no Unicode case-folding (``K`` Kelvin sign → ``k``)
+      can land a provider-asserted address on an ASCII row.
+    Apple "Hide My Email" relay addresses fail the domain check by design.
+    """
+    if not email or not email.isascii() or "@" not in email:
+        return ""
+    if str(claims.get("email_verified", "")).strip().lower() != "true":
+        return ""
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if provider == "google":
+        hd = str(claims.get("hd") or "").strip().lower()
+        if domain in _GOOGLE_HOSTED_DOMAINS or (hd and hd == domain):
+            return email
+    elif provider == "apple" and domain in _APPLE_HOSTED_DOMAINS:
+        return email
+    return ""
+
+
+def _user_to_link_by_email(
+    db: Session, provider: str, link_email: str
+) -> UserRow | None:
+    """The existing user a new ``provider`` identity should sign in as.
+
+    ``link_email`` comes from ``_linkable_email``: the provider vouches that
+    the signer controls that mailbox, the same proof a magic link gives.
+    Matching is the magic-link lookup (case-insensitive, exact otherwise;
+    exact-case then oldest row first).
+
+    A row from the *same* provider under a different subject is skipped:
+    that is a deleted-and-recreated account or a reassigned address, i.e.
+    possibly another person.
+    """
+    if not link_email:
+        return None
+    return next(
+        (
+            u
+            for u in _users_with_email(db, _normalize_email(link_email))
+            if u.provider != provider
+        ),
+        None,
+    )
+
+
 def _find_or_create_user(
     db: Session,
     provider: str,
@@ -158,8 +219,15 @@ def _find_or_create_user(
     name: str,
     on_new_user: callable | None = None,
     request: Request | None = None,
+    link_email: str = "",
 ) -> UserRow:
     """Find an existing user by (provider, provider_sub) or create a new one.
+
+    A first sign-in with a new provider lands on the account that already
+    holds ``link_email`` (from ``_linkable_email``; see
+    ``_user_to_link_by_email``), so one person signing in with Google, Apple
+    and magic-link sees one set of data. The matched row keeps its own
+    provider/provider_sub; this sign-in finds it again by email next time.
 
     Updates email/name on returning users if changed.
     """
@@ -168,6 +236,13 @@ def _find_or_create_user(
         .filter_by(provider=provider, provider_sub=provider_sub)
         .first()
     )
+    if user is None:
+        user = _user_to_link_by_email(db, provider, link_email)
+        if user is not None:
+            logger.info(
+                "Linked %s sign-in to existing %s user %s by email",
+                provider, user.provider, user.id,
+            )
     if user is None:
         user = UserRow(
             id=str(uuid.uuid4()),
@@ -367,6 +442,9 @@ def create_auth_router(
         user = _find_or_create_user(
             db, provider, provider_sub, email, name,
             on_new_user=on_new_user, request=request,
+            link_email=_linkable_email(
+                provider, token.get("userinfo") or {}, email
+            ),
         )
 
         if not user.approved:
@@ -524,6 +602,7 @@ def create_auth_router(
         user = _find_or_create_user(
             db, "apple", sub, email, name,
             on_new_user=on_new_user, request=request,
+            link_email=_linkable_email("apple", claims, email),
         )
 
         if not user.approved:
