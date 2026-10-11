@@ -1005,3 +1005,181 @@ def test_token_exchange_without_secret_still_rejected(client):
     })
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_client"
+
+
+# --- Client authentication methods (client_secret_basic, #ChatGPT connector) ---
+
+
+def _basic_header(client_id, client_secret):
+    import base64
+    from urllib.parse import quote_plus
+
+    raw = f"{quote_plus(client_id)}:{quote_plus(client_secret)}".encode()
+    return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
+
+
+def _code_exchange_form(code, verifier):
+    return {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "https://example.com/callback",
+        "code_verifier": verifier,
+    }
+
+
+def test_register_echoes_token_endpoint_auth_method(client):
+    """A client that omits the method must assume client_secret_basic
+    (RFC 7591 §2), so the response always states the one granted."""
+    def _register(**extra):
+        return client.post("/oauth/register", json={
+            "client_name": "C", "redirect_uris": ["https://example.com/callback"], **extra,
+        }).json()
+
+    assert _register()["token_endpoint_auth_method"] == "client_secret_post"
+    assert _register(token_endpoint_auth_method="client_secret_basic")[
+        "token_endpoint_auth_method"] == "client_secret_basic"
+    # A public client ("none") still gets a secret and is told to post it.
+    data = _register(token_endpoint_auth_method="none")
+    assert data["token_endpoint_auth_method"] == "client_secret_post"
+    assert data["client_secret"]
+
+
+def test_token_exchange_with_basic_auth(client):
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers=_basic_header(client_id, client_secret),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["access_token"].startswith("ff_")
+
+
+def test_refresh_with_basic_auth(client):
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+    tokens = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers=_basic_header(client_id, client_secret),
+    ).json()
+
+    resp = client.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+        headers=_basic_header(client_id, client_secret),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_basic_auth_with_matching_form_client_id_accepted(client):
+    """client_id in the body alongside Basic is allowed when it matches —
+    only a second secret counts as a second authentication method."""
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data={**_code_exchange_form(code, verifier), "client_id": client_id},
+        headers=_basic_header(client_id, client_secret),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_basic_auth_wrong_secret_rejected(client, caplog):
+    client_id, _ = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    with caplog.at_level("WARNING", logger="flyfun_common.oauth.router"):
+        resp = client.post(
+            "/oauth/token",
+            data=_code_exchange_form(code, verifier),
+            headers=_basic_header(client_id, "wrong_secret"),
+        )
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_client"
+    assert resp.headers["www-authenticate"].startswith("Basic")
+    # The diagnostic names the method, never the secret.
+    assert "credentials via basic" in caplog.text
+    assert "wrong_secret" not in caplog.text
+
+
+def test_basic_auth_plus_form_secret_rejected(client):
+    """RFC 6749 §2.3: a client MUST NOT use more than one method."""
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data={**_code_exchange_form(code, verifier),
+              "client_id": client_id, "client_secret": client_secret},
+        headers=_basic_header(client_id, client_secret),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+def test_basic_auth_mismatched_form_client_id_rejected(client):
+    client_id, client_secret = _register_client(client)
+    other_id, _ = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data={**_code_exchange_form(code, verifier), "client_id": other_id},
+        headers=_basic_header(client_id, client_secret),
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("value", ["Basic !!!notbase64", "Basic " + "bm9jb2xvbg=="])
+def test_malformed_basic_header_rejected(client, value):
+    """Undecodable base64, or a decoded value without the id:secret colon."""
+    client_id, _ = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers={"Authorization": value},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_client"
+
+
+def test_basic_auth_cannot_skip_pkce_and_secret(client):
+    """The no-PKCE invariant holds for Basic too: Basic with an empty secret
+    is treated as missing credentials."""
+    client_id, _ = _register_client(client)
+    code = _approve_no_pkce(client, client_id)
+
+    resp = client.post(
+        "/oauth/token",
+        data={"grant_type": "authorization_code", "code": code,
+              "redirect_uri": "https://example.com/callback"},
+        headers=_basic_header(client_id, ""),
+    )
+    assert resp.status_code == 401
+
+
+def test_missing_credentials_logged_as_none(client, caplog):
+    client_id, _ = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    with caplog.at_level("WARNING", logger="flyfun_common.oauth.router"):
+        resp = client.post("/oauth/token", data={
+            **_code_exchange_form(code, verifier), "client_id": client_id,
+        })
+    assert resp.status_code == 401
+    assert "credentials via none" in caplog.text
+    assert client_id in caplog.text
