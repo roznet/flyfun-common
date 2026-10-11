@@ -1183,3 +1183,107 @@ def test_missing_credentials_logged_as_none(client, caplog):
     assert resp.status_code == 401
     assert "credentials via none" in caplog.text
     assert client_id in caplog.text
+
+
+def test_rejected_token_request_log_cannot_forge_lines(client, caplog):
+    """client_id is unauthenticated input: a newline in it must not start a
+    new log line, and a long value is truncated."""
+    with caplog.at_level("WARNING", logger="flyfun_common.oauth.router"):
+        client.post("/oauth/token", data={
+            "grant_type": "authorization_code",
+            "code": "x",
+            "client_id": "evil\n2026-10-11 CRITICAL forged" + "A" * 200,
+        })
+    [record] = [r for r in caplog.records if "rejected" in r.getMessage()]
+    message = record.getMessage()
+    assert "\n" not in message
+    assert "A" * 100 not in message
+
+
+def test_register_log_cannot_forge_lines(client, caplog):
+    with caplog.at_level("INFO", logger="flyfun_common.oauth.router"):
+        client.post("/oauth/register", json={
+            "client_name": "C\nforged line",
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none\nforged",
+        })
+    [record] = [r for r in caplog.records if "registered" in r.getMessage()]
+    assert "\n" not in record.getMessage()
+
+
+def test_two_methods_rejection_is_logged(client, caplog):
+    client_id, client_secret = _register_client(client)
+    with caplog.at_level("WARNING", logger="flyfun_common.oauth.router"):
+        resp = client.post(
+            "/oauth/token",
+            data={"grant_type": "authorization_code", "code": "x",
+                  "client_id": client_id, "client_secret": client_secret},
+            headers=_basic_header(client_id, client_secret),
+        )
+    assert resp.status_code == 400
+    assert "credentials via basic+form" in caplog.text
+    assert client_secret not in caplog.text
+
+
+def test_basic_auth_cannot_redeem_another_clients_code(client):
+    """Basic credentials of client B, valid in themselves, cannot redeem a
+    code issued to client A (the handler binds the code to the client)."""
+    a_id, _ = _register_client(client)
+    b_id, b_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, a_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers=_basic_header(b_id, b_secret),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_grant"
+
+
+def test_basic_auth_cannot_use_another_clients_refresh_token(client):
+    a_id, a_secret = _register_client(client)
+    b_id, b_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, a_id, challenge)
+    tokens = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers=_basic_header(a_id, a_secret),
+    ).json()
+
+    resp = client.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+        headers=_basic_header(b_id, b_secret),
+    )
+    assert resp.status_code == 400
+
+
+def test_basic_scheme_is_case_insensitive(client):
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+    header = _basic_header(client_id, client_secret)["Authorization"].replace("Basic", "basic")
+
+    resp = client.post(
+        "/oauth/token",
+        data=_code_exchange_form(code, verifier),
+        headers={"Authorization": header},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_non_basic_authorization_header_falls_back_to_form(client):
+    client_id, client_secret = _register_client(client)
+    verifier, challenge = _make_challenge()
+    code = _approve_and_get_code(client, client_id, challenge)
+
+    resp = client.post(
+        "/oauth/token",
+        data={**_code_exchange_form(code, verifier),
+              "client_id": client_id, "client_secret": client_secret},
+        headers={"Authorization": "Bearer something"},
+    )
+    assert resp.status_code == 200, resp.text

@@ -73,12 +73,26 @@ def _basic_client_credentials(header: str | None) -> tuple[str, str] | None:
     return unquote_plus(raw_id), unquote_plus(raw_secret)
 
 
-def _invalid_client(method: str, client_id: str | None, description: str) -> JSONResponse:
-    """401 invalid_client, logged with how the credentials arrived (never their values)."""
+def _loggable(value: str | None, limit: int = 64) -> str:
+    """Unauthenticated input for a log line: repr() so a newline or control
+    character cannot forge a line, truncated so a misplaced secret or a huge
+    value is not written out whole."""
+    if value is None:
+        return "-"
+    return repr(value[:limit]) + ("…" if len(value) > limit else "")
+
+
+def _log_rejected_token_request(description: str, method: str, client_id: str | None) -> None:
+    """How the credentials arrived (basic/form/none), never their values."""
     logger.warning(
         "OAuth token request rejected: %s (client_id=%s, credentials via %s)",
-        description, client_id or "-", method,
+        description, _loggable(client_id), method,
     )
+
+
+def _invalid_client(method: str, client_id: str | None, description: str) -> JSONResponse:
+    """401 invalid_client, logged with how the credentials arrived."""
+    _log_rejected_token_request(description, method, client_id)
     headers = {"WWW-Authenticate": 'Basic realm="oauth"'} if method == "basic" else None
     return JSONResponse(
         {"error": "invalid_client", "error_description": description},
@@ -403,7 +417,8 @@ def create_oauth_router(
         )
         logger.info(
             "OAuth client %s registered (%s): requested auth method %s, granted %s",
-            client_id, body.client_name, body.token_endpoint_auth_method, auth_method,
+            client_id, _loggable(body.client_name),
+            _loggable(body.token_endpoint_auth_method), auth_method,
         )
 
         return {
@@ -607,6 +622,9 @@ def create_oauth_router(
         if basic is not None:
             # RFC 6749 §2.3: a client MUST NOT use more than one method.
             if client_secret is not None or (client_id and client_id != basic[0]):
+                _log_rejected_token_request(
+                    "two client authentication methods", "basic+form", basic[0]
+                )
                 return JSONResponse(
                     {
                         "error": "invalid_request",
