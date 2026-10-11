@@ -48,7 +48,7 @@ Claude.ai GETs `mcp.flyfun.aero/.well-known/oauth-authorization-server`:
   "registration_endpoint": "https://weather.flyfun.aero/oauth/register",
   "response_types_supported": ["code"],
   "grant_types_supported": ["authorization_code", "refresh_token"],
-  "token_endpoint_auth_methods_supported": ["client_secret_post"],
+  "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
   "code_challenge_methods_supported": ["S256"],
   "scopes_supported": ["mcp", "flights:read"]
 }
@@ -84,9 +84,12 @@ Response:
   "client_secret": "secret_xyz",
   "client_name": "Claude.ai - Acme Corp",
   "redirect_uris": ["https://claude.ai/oauth/callback"],
-  "grant_types": ["authorization_code", "refresh_token"]
+  "grant_types": ["authorization_code", "refresh_token"],
+  "token_endpoint_auth_method": "client_secret_post"
 }
 ```
+
+`token_endpoint_auth_method` echoes the requested `client_secret_post` or `client_secret_basic`; anything else (including `none`, a public client) is answered with `client_secret_post`, since every client gets a secret (RFC 7591 §3.2.1 lets the server replace it). Always echo it: a client that gets no value back must assume `client_secret_basic` (RFC 7591 §2). Before `0.6.11` the token endpoint was form-only and the method was not echoed; ChatGPT's MCP connector got 401 at `/oauth/token` after a successful consent, most likely for this reason (the new log lines settle it). The registration log line records the method the client asked for.
 
 `redirect_uris` are validated by `_validate_redirect_uri`: **HTTPS**, **http loopback** (`localhost`/`127.0.0.1`, for dev), or an **RFC 8252 §7.1 private-use URI scheme** — a reverse-domain scheme like `net.ro-z.flyfun-example://oauth-callback` used by native iOS/Android apps (#274). URIs containing whitespace, control characters or characters RFC 3986 never allows (`` <>"`{}|\^ ``) are rejected. Independently, the HTML redirect pages (error and approve) escape the URL for both the meta-refresh attribute and the inline script, so a stored URI can never inject markup.
 
@@ -150,7 +153,7 @@ code_verifier=<PKCE verifier>
 ```
 
 The endpoint:
-1. Validates client_id + client_secret
+1. Validates client_id + client_secret, sent either as form fields (`client_secret_post`) or in an `Authorization: Basic` header (`client_secret_basic`, both parts form-urlencoded before base64, RFC 6749 §2.3.1). Using both in one request is `400 invalid_request` (a form `client_id` that matches the header is allowed). A failure is `401 invalid_client` (with `WWW-Authenticate: Basic` when Basic was used) and logs one warning naming the client_id and how credentials arrived — `basic`, `form` or `none` — never their values.
 2. Looks up the authorization code — checks: not expired, not used, redirect_uri matches, PKCE verifier matches
 3. Marks code as used
 4. Generates a Bearer token via `generate_api_token()` → stores in `api_tokens` with:

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, unquote_plus, urlencode, urlparse
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -28,6 +31,8 @@ from flyfun_common.oauth.models import (
 )
 from flyfun_common.oauth.pkce import verify_pkce_s256
 
+logger = logging.getLogger(__name__)
+
 _CODE_LIFETIME = timedelta(minutes=10)
 
 
@@ -38,10 +43,48 @@ class RegisterRequest(BaseModel):
     client_name: str
     redirect_uris: list[str]
     grant_types: list[str] = ["authorization_code", "refresh_token"]
-    token_endpoint_auth_method: str = "client_secret_post"
+    token_endpoint_auth_method: str | None = None
 
 
 # --- Helpers ---
+
+_TOKEN_ENDPOINT_METHODS = frozenset({"client_secret_post", "client_secret_basic"})
+
+
+def _basic_client_credentials(header: str | None) -> tuple[str, str] | None:
+    """(client_id, client_secret) from an ``Authorization: Basic`` header.
+
+    None when the header is absent or another scheme; ValueError when it is
+    Basic but malformed. Per RFC 6749 §2.3.1 both parts are form-urlencoded
+    before base64, so they are unquoted after the split.
+    """
+    if not header:
+        return None
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "basic":
+        return None
+    try:
+        decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise ValueError("malformed Basic credentials") from exc
+    if ":" not in decoded:
+        raise ValueError("malformed Basic credentials")
+    raw_id, _, raw_secret = decoded.partition(":")
+    return unquote_plus(raw_id), unquote_plus(raw_secret)
+
+
+def _invalid_client(method: str, client_id: str | None, description: str) -> JSONResponse:
+    """401 invalid_client, logged with how the credentials arrived (never their values)."""
+    logger.warning(
+        "OAuth token request rejected: %s (client_id=%s, credentials via %s)",
+        description, client_id or "-", method,
+    )
+    headers = {"WWW-Authenticate": 'Basic realm="oauth"'} if method == "basic" else None
+    return JSONResponse(
+        {"error": "invalid_client", "error_description": description},
+        status_code=401,
+        headers=headers,
+    )
 
 
 def _oauth_error_redirect(
@@ -349,12 +392,27 @@ def create_oauth_router(
         db.add(row)
         db.flush()
 
+        # Every client gets a secret, so a request for "none" (public client)
+        # is answered with client_secret_post (RFC 7591 §3.2.1 lets the server
+        # replace the value). Echoing the method matters: when it is absent a
+        # client must assume client_secret_basic.
+        auth_method = (
+            body.token_endpoint_auth_method
+            if body.token_endpoint_auth_method in _TOKEN_ENDPOINT_METHODS
+            else "client_secret_post"
+        )
+        logger.info(
+            "OAuth client %s registered (%s): requested auth method %s, granted %s",
+            client_id, body.client_name, body.token_endpoint_auth_method, auth_method,
+        )
+
         return {
             "client_id": client_id,
             "client_secret": client_secret,
             "client_name": body.client_name,
             "redirect_uris": body.redirect_uris,
             "grant_types": body.grant_types,
+            "token_endpoint_auth_method": auth_method,
         }
 
     # ---- Authorization Endpoint ----
@@ -541,21 +599,34 @@ def create_oauth_router(
         # refresh_token params
         refresh_token: str | None = Form(None),
     ):
-        # Validate client credentials
+        # Validate client credentials: client_secret_basic or client_secret_post
+        try:
+            basic = _basic_client_credentials(request.headers.get("authorization"))
+        except ValueError:
+            return _invalid_client("basic", client_id, "Malformed Basic credentials")
+        if basic is not None:
+            # RFC 6749 §2.3: a client MUST NOT use more than one method.
+            if client_secret is not None or (client_id and client_id != basic[0]):
+                return JSONResponse(
+                    {
+                        "error": "invalid_request",
+                        "error_description": "Use one client authentication method",
+                    },
+                    status_code=400,
+                )
+            method = "basic"
+            client_id, client_secret = basic
+        else:
+            method = "form" if client_secret else "none"
+
         if not client_id or not client_secret:
-            return JSONResponse(
-                {"error": "invalid_client", "error_description": "Missing client credentials"},
-                status_code=401,
-            )
+            return _invalid_client(method, client_id, "Missing client credentials")
 
         client = db.query(OAuthClientRow).filter(OAuthClientRow.id == client_id).first()
         if not client or not hmac.compare_digest(
             hash_token(client_secret), client.client_secret_hash
         ):
-            return JSONResponse(
-                {"error": "invalid_client", "error_description": "Bad client credentials"},
-                status_code=401,
-            )
+            return _invalid_client(method, client_id, "Bad client credentials")
 
         if grant_type == "authorization_code":
             return _handle_authorization_code(
