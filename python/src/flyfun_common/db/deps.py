@@ -100,7 +100,19 @@ def _enforce_scope(request: Request, scope: str | None) -> None:
 
 
 def get_db() -> Generator[Session, None, None]:
-    """Yield a SQLAlchemy session, committing on success or rolling back on error."""
+    """Yield a SQLAlchemy session, committing on success or rolling back on error.
+
+    Declare it as ``Depends(get_db, scope="function")``. The default
+    ("request") scope runs the commit after the response has been sent, so a
+    client's immediate follow-up request can read the pre-write state, and a
+    failed commit is never reported to the client. ``"function"`` commits after
+    the endpoint and its response serialization, before anything is sent.
+
+    Every dependency in this library uses ``"function"``, and FastAPI caches
+    a dependency per (callable, scope): an app that mixes in a bare
+    ``Depends(get_db)`` gets a second session in the same request. Check an
+    app with ``find_request_scoped_db``.
+    """
     session = SessionLocal()
     try:
         yield session
@@ -110,6 +122,36 @@ def get_db() -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
+
+
+def find_request_scoped_db(app) -> list[str]:
+    """List the routes of ``app`` that resolve ``get_db`` without ``scope="function"``.
+
+    Each entry is ``"METHODS path"``. Meant for an app's test suite:
+    ``assert find_request_scoped_db(app) == []``.
+    """
+    found: list[str] = []
+
+    def _uses_request_scope(dependant) -> bool:
+        for sub in dependant.dependencies:
+            if sub.call is get_db and sub.computed_scope != "function":
+                return True
+            if _uses_request_scope(sub):
+                return True
+        return False
+
+    def _walk(routes, prefix: str = "") -> None:
+        for route in routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is not None and _uses_request_scope(dependant):
+                methods = ",".join(sorted(getattr(route, "methods", None) or ["WS"]))
+                found.append(f"{methods} {prefix}{route.path}")
+            sub_routes = getattr(getattr(route, "app", None), "routes", None)
+            if dependant is None and sub_routes is not None:
+                _walk(sub_routes, prefix + getattr(route, "path", ""))
+
+    _walk(app.routes)
+    return found
 
 
 def _is_api_token(token: str) -> bool:
@@ -220,7 +262,7 @@ def _mark_if_session(request: Request, user_id: str, token_iat: int | None) -> N
 
 def current_user_id(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> str:
     """Return the authenticated user ID. Raises 401/403 on failure."""
     user_id, token_iat, scope = _decode_user_id(request, db)
@@ -245,7 +287,7 @@ def current_user_id(
 
 def optional_user_id(
     request: Request,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> str | None:
     """Return the authenticated user ID, or None if not authenticated.
 

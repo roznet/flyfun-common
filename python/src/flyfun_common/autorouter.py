@@ -312,7 +312,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
         code: str | None = None,
         state: str | None = None,
         error: str | None = None,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Exchange the authorization code for an access token."""
         # Validate state to prevent CSRF
@@ -404,7 +404,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
     async def link_complete(
         body: LinkCompleteRequest,
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Store the Autorouter token from an app callback's code.
 
@@ -430,7 +430,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
     @router.get("/autorouter/status")
     async def status(
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Check whether the user has a linked Autorouter account."""
         creds = load_encrypted_creds(db, user_id)
@@ -443,7 +443,7 @@ def create_autorouter_router(*, success_redirect: str = "/settings.html?autorout
     @router.post("/autorouter/unlink")
     async def unlink(
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Remove stored Autorouter credentials."""
         creds = load_encrypted_creds(db, user_id) or {}
@@ -719,7 +719,7 @@ def create_autorouter_routes_router(
     @router.get("/status", response_model=AutorouterLinkStatus)
     def link_status(
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ) -> AutorouterLinkStatus:
         loader = token_loader or get_autorouter_token
         return AutorouterLinkStatus(linked=bool(loader(db, user_id)))
@@ -728,7 +728,7 @@ def create_autorouter_routes_router(
     def list_routes(
         limit: int = 25,
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ) -> AutorouterRoutesResponse:
         try:
             routes = fetch_recent_routes(db, user_id, limit, token_loader=token_loader)

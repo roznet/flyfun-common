@@ -341,7 +341,7 @@ def create_oauth_router(
 
     @router.post("/oauth/register")
     async def register(
-        body: RegisterRequest, request: Request, db: Session = Depends(get_db)
+        body: RegisterRequest, request: Request, db: Session = Depends(get_db, scope="function")
     ):
         # Throttle open registration (RFC 7591) so it can't be used as an
         # unbounded DB-spam / phishing-client factory. Sliding windows over the
@@ -442,7 +442,7 @@ def create_oauth_router(
         code_challenge_method: str | None = None,
         state: str = "",
         scope: str | None = None,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         # Validate response_type
         if response_type != "code":
@@ -529,7 +529,7 @@ def create_oauth_router(
         state: str = Form(""),
         scope: str = Form(""),
         csrf_token: str = Form(...),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         # Must be authenticated
         user_id = optional_user_id(request, db)
@@ -603,7 +603,7 @@ def create_oauth_router(
     async def token(
         request: Request,
         grant_type: str = Form(...),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
         # authorization_code params
         code: str | None = Form(None),
         redirect_uri: str | None = Form(None),

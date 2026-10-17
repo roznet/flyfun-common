@@ -267,7 +267,7 @@ def build_magic_link_router(
     async def request_magic_link(
         body: MagicLinkRequestBody,
         request: Request,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         if send_magic_link_email is None:
             raise HTTPException(
@@ -345,7 +345,7 @@ def build_magic_link_router(
     async def consume(
         body: MagicLinkConsumeBody,
         request: Request,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         ip = _client_ip(request)
         record_consume_attempt(db, ip)
@@ -399,7 +399,7 @@ def build_magic_link_router(
     async def consume_code(
         body: MagicLinkConsumeCodeBody,
         request: Request,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """iOS flow. Returns the JWT in JSON; no cookie set."""
         ip = _client_ip(request)

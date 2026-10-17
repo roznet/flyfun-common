@@ -27,6 +27,7 @@ def __getattr__(name: str):
         "get_db",
         "current_user_id",
         "optional_user_id",
+        "find_request_scoped_db",
         "register_broad_scope",
         "register_scope_paths",
     ):
@@ -54,6 +55,7 @@ __all__ = [
     "get_db",
     "current_user_id",
     "optional_user_id",
+    "find_request_scoped_db",
     "register_broad_scope",
     "register_scope_paths",
 ]
