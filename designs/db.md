@@ -152,10 +152,19 @@ session.close()
 from flyfun_common.db import get_db, current_user_id
 
 @app.post("/my-action")
-def my_action(user_id: str = Depends(current_user_id), db=Depends(get_db)):
+def my_action(
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db, scope="function"),
+):
     # user_id is validated: exists in DB + approved
     db.add(MyAppModel(user_id=user_id, ...))
-    # session auto-commits via get_db() generator
+    # session auto-commits via get_db() generator, before the response is sent
+```
+
+```python
+# In each app's test suite: no route may resolve get_db at request scope
+from flyfun_common.db import find_request_scoped_db
+assert find_request_scoped_db(app) == []
 ```
 
 ```python
@@ -233,12 +242,15 @@ def cleanup_orphaned_data():
 - **`cost_ledger` extended columns** (`category`, `description`, `detail_json`, `reference_id`): All nullable so simple apps (maps, forms) can call `record_cost()` with just the positional args, while weather stores rich CostBreakdown data in `detail_json`.
 - **Single `flyfun.db` in dev**: All apps share one SQLite file locally. Simulates the shared MySQL in production.
 - **`get_db()` auto-commits**: The generator commits on success, rolls back on exception. Endpoints don't need explicit `db.commit()`.
+- **`get_db` is always `Depends(get_db, scope="function")`** (since 0.6.12, needs FastAPI ≥ 0.121): the default "request" scope runs the commit *after the response is sent*, so an immediate follow-up request could read the pre-write state (flyfun-weather #784: MCP `create_flight` → refresh 404'd 14 ms later), and a failed commit returned 200. "function" scope commits after the endpoint and its response serialization, before the first byte goes out; a failed commit is a 500. Every library dependency (`current_user_id`, `optional_user_id`, the auth/OAuth/Autorouter/admin-hub routers) uses it.
 
 ## Gotchas
 
 - `get_engine()` is a **singleton** — once created, changing env vars has no effect. Use `reset_engine()` in tests.
 - `init_shared_db()` calls `Base.metadata.create_all()` which only creates tables from `flyfun_common.db.models`. App tables need their own `create_all()` call.
 - In dev mode, `current_user_id()` always returns `"dev-user-001"` without touching the DB.
+- **Never mix a bare `Depends(get_db)` into an app.** FastAPI caches a dependency per (callable, scope), so a request-scoped `get_db` next to the library's function-scoped one gives the request **two sessions**: a second connection in prod, and in tests on a single `StaticPool` connection, closing one session rolls back the other's uncommitted writes. `find_request_scoped_db(app)` lists offending routes (nested dependencies included); assert it is empty. A request-scoped *yield* dependency that depends on the function-scoped `get_db` fails at import (`DependencyScopeError`) — give it `scope="function"` too.
+- Session work after the endpoint returns (a `StreamingResponse` body, `BackgroundTasks`) runs after the session is closed: open a `SessionLocal()` there instead.
 - `SessionLocal` must be configured (via `get_engine()` or `init_shared_db()`) before `get_db()` is called.
 
 ## Environment Variables

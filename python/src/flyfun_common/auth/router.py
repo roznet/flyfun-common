@@ -402,7 +402,7 @@ def create_auth_router(
     @router.get("/callback/{provider}")
     @router.post("/callback/{provider}")  # Apple uses form_post (POST)
     async def callback(
-        provider: str, request: Request, db: Session = Depends(get_db)
+        provider: str, request: Request, db: Session = Depends(get_db, scope="function")
     ):
         if provider not in SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=404, detail=f"Unknown provider: {provider}")
@@ -496,7 +496,7 @@ def create_auth_router(
     async def exchange(
         body: ExchangeCodeRequest,
         request: Request,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Trade a native auth-code for the session JWT (auth-code flow).
 
@@ -540,7 +540,7 @@ def create_auth_router(
     async def apple_token(
         body: AppleTokenRequest,
         request: Request,
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Validate an Apple identity token from a native iOS app.
 
@@ -623,7 +623,7 @@ def create_auth_router(
     @router.post("/logout-all")
     async def logout_all(
         user_id: str = Depends(current_user_id),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         """Revoke every outstanding session for the caller.
 
@@ -645,7 +645,7 @@ def create_auth_router(
 
     @router.get("/me")
     async def get_me(
-        user_id: str = Depends(current_user_id), db: Session = Depends(get_db)
+        user_id: str = Depends(current_user_id), db: Session = Depends(get_db, scope="function")
     ):
         user = db.get(UserRow, user_id)
         if not user:
@@ -659,7 +659,7 @@ def create_auth_router(
 
     @router.delete("/account", status_code=204)
     async def delete_account(
-        user_id: str = Depends(current_user_id), db: Session = Depends(get_db)
+        user_id: str = Depends(current_user_id), db: Session = Depends(get_db, scope="function")
     ):
         """Delete the authenticated user's account and all associated data.
 

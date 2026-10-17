@@ -31,7 +31,7 @@ def create_hub_router(
     def get_hub_users(
         period: str = Query("30d", pattern="^(30d|all)$"),
         _admin_id: str = Depends(require_admin),
-        db: Session = Depends(get_db),
+        db: Session = Depends(get_db, scope="function"),
     ):
         since = None
         if period == "30d":
