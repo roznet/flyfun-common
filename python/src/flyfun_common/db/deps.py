@@ -128,30 +128,53 @@ def find_request_scoped_db(app) -> list[str]:
     """List the routes of ``app`` that resolve ``get_db`` without ``scope="function"``.
 
     Each entry is ``"METHODS path"``. Meant for an app's test suite:
-    ``assert find_request_scoped_db(app) == []``.
+    ``assert find_request_scoped_db(app) == []``. It matches ``get_db``
+    itself: a wrapper generator (``yield from get_db()``) is not seen, and
+    needs ``scope="function"`` on its own ``Depends``.
     """
-    found: list[str] = []
 
     def _uses_request_scope(dependant) -> bool:
         for sub in dependant.dependencies:
-            if sub.call is get_db and sub.computed_scope != "function":
+            # ``scope`` is what FastAPI checks to pick the function exit stack.
+            if sub.call is get_db and sub.scope != "function":
                 return True
             if _uses_request_scope(sub):
                 return True
         return False
 
-    def _walk(routes, prefix: str = "") -> None:
-        for route in routes:
-            dependant = getattr(route, "dependant", None)
-            if dependant is not None and _uses_request_scope(dependant):
-                methods = ",".join(sorted(getattr(route, "methods", None) or ["WS"]))
-                found.append(f"{methods} {prefix}{route.path}")
-            sub_routes = getattr(getattr(route, "app", None), "routes", None)
-            if dependant is None and sub_routes is not None:
-                _walk(sub_routes, prefix + getattr(route, "path", ""))
+    return [
+        label
+        for label, dependant in _iter_route_dependants(app.routes)
+        if _uses_request_scope(dependant)
+    ]
 
-    _walk(app.routes)
-    return found
+
+def _iter_route_dependants(routes, prefix: str = ""):
+    """Yield ``("METHODS path", dependant)`` for every route, mounts included.
+
+    FastAPI >= 0.140 keeps an included router as one lazy entry whose
+    effective contexts carry each route's dependant with the include-level
+    dependencies merged in. Older releases flatten into ``APIRoute``s.
+    """
+    for route in routes:
+        contexts = getattr(route, "effective_route_contexts", None)
+        if callable(contexts):
+            for context in contexts():
+                if getattr(context, "dependant", None) is not None:
+                    yield from _iter_route_dependants([context], prefix)
+                else:
+                    yield from _iter_route_dependants(
+                        [context.starlette_route or context.original_route], prefix
+                    )
+            continue
+        dependant = getattr(route, "dependant", None)
+        if dependant is not None:
+            methods = ",".join(sorted(getattr(route, "methods", None) or ["WS"]))
+            yield f"{methods} {prefix}{route.path}", dependant
+            continue
+        sub_routes = getattr(getattr(route, "app", None), "routes", None)
+        if sub_routes is not None:
+            yield from _iter_route_dependants(sub_routes, prefix + getattr(route, "path", ""))
 
 
 def _is_api_token(token: str) -> bool:

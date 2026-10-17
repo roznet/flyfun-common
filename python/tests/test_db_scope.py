@@ -10,12 +10,12 @@ session on its own connection, the way a second request would.
 """
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from flyfun_common.db import engine as db_engine
-from flyfun_common.db.deps import find_request_scoped_db, get_db
+from flyfun_common.db.deps import _iter_route_dependants, find_request_scoped_db, get_db
 from flyfun_common.db.models import Base, UserRow
 
 
@@ -86,6 +86,21 @@ def test_a_failed_commit_reaches_the_client(file_db):
     assert TestClient(app, raise_server_exceptions=False).post("/dup").status_code == 500
 
 
+def test_a_failed_commit_at_request_scope_still_answers_200(file_db):
+    # Control for the test above: the 200 is already sent when the commit fails.
+    with db_engine.SessionLocal() as s:
+        s.add(UserRow(id="dup", email="dup@example.com", display_name="dup"))
+        s.commit()
+    app = FastAPI()
+
+    @app.post("/dup")
+    def add_duplicate(db: Session = Depends(get_db)):
+        db.add(UserRow(id="dup", email="other@example.com", display_name="dup"))
+        return {"ok": True}
+
+    assert TestClient(app, raise_server_exceptions=False).post("/dup").status_code == 200
+
+
 def test_library_routers_are_function_scoped(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "test-secret")
     from flyfun_common.admin_hub import create_hub_router
@@ -97,12 +112,15 @@ def test_library_routers_are_function_scoped(monkeypatch):
     from flyfun_common.oauth.router import create_oauth_router
 
     app = FastAPI()
-    app.include_router(create_auth_router())
+    # The magic-link sub-router is mounted only with an email sender.
+    app.include_router(create_auth_router(send_magic_link_email=lambda *a, **k: None))
     app.include_router(create_oauth_router())
     app.include_router(create_hub_router(require_admin=lambda: None))
     app.include_router(create_autorouter_router())
     app.include_router(create_autorouter_routes_router())
-    assert len(app.routes) > 20
+    labels = [label for label, _ in _iter_route_dependants(app.routes)]
+    assert len(labels) > 20
+    assert any("magic" in label for label in labels)
     assert find_request_scoped_db(app) == []
 
 
@@ -124,4 +142,36 @@ def test_find_request_scoped_db_flags_bare_and_nested_get_db():
     def scoped(db: Session = Depends(get_db, scope="function")):
         return {}
 
-    assert find_request_scoped_db(app) == ["GET /bare", "GET /nested"]
+    routed = APIRouter(prefix="/routed")
+
+    @routed.get("/bare")
+    def routed_bare(db: Session = Depends(get_db)):
+        return {}
+
+    @routed.get("/scoped")
+    def routed_scoped(db: Session = Depends(get_db, scope="function")):
+        return {}
+
+    guarded = APIRouter(prefix="/guarded")
+
+    @guarded.get("/x")
+    def guarded_x():
+        return {}
+
+    sub = FastAPI()
+
+    @sub.get("/bare")
+    def sub_bare(db: Session = Depends(get_db)):
+        return {}
+
+    app.include_router(routed)
+    app.include_router(guarded, dependencies=[Depends(get_db)])
+    app.mount("/sub", sub)
+
+    assert sorted(find_request_scoped_db(app)) == [
+        "GET /bare",
+        "GET /guarded/x",
+        "GET /nested",
+        "GET /routed/bare",
+        "GET /sub/bare",
+    ]
