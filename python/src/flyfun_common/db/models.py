@@ -39,6 +39,17 @@ class UserRow(Base):
     tokens_valid_after: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # Last request authenticated by a first-party session (web cookie or app
+    # JWT), at ``LAST_SEEN_RESOLUTION`` granularity — the "who used the app"
+    # signal for admin activity counts. API/OAuth tokens track their own
+    # ``ApiTokenRow.last_used_at`` and never touch this. NULL = not seen since
+    # the column shipped. Created by the weather app's Alembic (shared DB).
+    # Deferred so loading a user never selects it: an app on this version
+    # keeps authenticating against a DB that doesn't have the column yet
+    # (the stamp then fails quietly, see ``deps._touch_last_seen``).
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, deferred=True
+    )
 
 
 class ApiTokenRow(Base):

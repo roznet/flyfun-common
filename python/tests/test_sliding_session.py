@@ -742,3 +742,152 @@ def test_abandoned_native_signin_does_not_steer_web_signin(callback_app):
     loc = client.get("/auth/callback/google", follow_redirects=False).headers["location"]
     assert not loc.startswith("flyfunforms:")
     assert "code=" not in loc
+
+
+# ---------- Last-seen tracking (users.last_seen_at) ----------
+
+def _last_seen():
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    s = SessionLocal()
+    try:
+        return s.get(UserRow, "u1").last_seen_at
+    finally:
+        s.close()
+
+
+def _set_last_seen(value) -> None:
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import UserRow
+
+    s = SessionLocal()
+    try:
+        s.get(UserRow, "u1").last_seen_at = value
+        s.commit()
+    finally:
+        s.close()
+
+
+@pytest.fixture
+def seen_app(epoch_app, monkeypatch):
+    from fastapi import Depends
+
+    from flyfun_common.db import deps
+    from flyfun_common.db.deps import current_user_id, register_passive_paths
+
+    monkeypatch.setattr(deps, "_PASSIVE_PATHS", [])
+    monkeypatch.setattr(deps, "_LAST_STAMP", {})
+    register_passive_paths([("GET", r"/badge")])
+
+    @epoch_app.get("/badge")
+    def badge(user_id: str = Depends(current_user_id)):
+        return {"user_id": user_id}
+
+    @epoch_app.post("/badge")
+    def badge_post(user_id: str = Depends(current_user_id)):
+        return {"user_id": user_id}
+
+    @epoch_app.get("/boom")
+    def boom(user_id: str = Depends(current_user_id)):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="nope")
+
+    return epoch_app
+
+
+def _assert_just_seen() -> None:
+    seen = _last_seen()
+    assert seen is not None
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    assert datetime.now(timezone.utc) - seen < timedelta(minutes=1)
+
+
+def _session_client(app) -> TestClient:
+    client = TestClient(app)
+    client.cookies.set(
+        COOKIE_NAME, _forge_token("epoch-secret", exp_in=timedelta(days=20), sub="u1"),
+    )
+    return client
+
+
+def test_last_seen_set_by_session_request(seen_app):
+    assert _last_seen() is None
+    assert _session_client(seen_app).get("/protected").status_code == 200
+    _assert_just_seen()
+
+
+def test_last_seen_set_by_bearer_jwt(seen_app):
+    token = _forge_token("epoch-secret", exp_in=timedelta(days=20), sub="u1")
+    resp = TestClient(seen_app).get(
+        "/protected", headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    _assert_just_seen()
+
+
+def test_last_seen_throttled_within_resolution(seen_app, monkeypatch):
+    from flyfun_common.db import deps
+
+    # Another process stamped 3 min ago: the SQL guard keeps it.
+    recent = datetime.now(timezone.utc) - timedelta(minutes=3)
+    _set_last_seen(recent)
+    _session_client(seen_app).get("/protected")
+    assert _last_seen().replace(tzinfo=timezone.utc) == recent
+
+    # This process stamped just now: no second UPDATE inside the window.
+    _set_last_seen(datetime.now(timezone.utc) - timedelta(minutes=30))
+    _session_client(seen_app).get("/protected")
+    assert datetime.now(timezone.utc) - _last_seen().replace(tzinfo=timezone.utc) > timedelta(minutes=20)
+
+    # Window over (process cache cleared): stamped again.
+    monkeypatch.setattr(deps, "_LAST_STAMP", {})
+    _session_client(seen_app).get("/protected")
+    _assert_just_seen()
+
+
+def test_last_seen_kept_when_request_fails_after_auth(seen_app):
+    assert _session_client(seen_app).get("/boom").status_code == 404
+    _assert_just_seen()
+
+
+def test_passive_rule_only_matches_its_method(seen_app):
+    assert _session_client(seen_app).post("/badge").status_code == 200
+    _assert_just_seen()
+
+
+def test_missing_column_never_breaks_auth(seen_app):
+    """A DB without users.last_seen_at (migration not yet run) still authenticates."""
+    from sqlalchemy import text
+
+    from flyfun_common.db.engine import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(text("ALTER TABLE users DROP COLUMN last_seen_at"))
+    assert _session_client(seen_app).get("/protected").status_code == 200
+
+
+def test_last_seen_skips_passive_paths(seen_app):
+    assert _session_client(seen_app).get("/badge").status_code == 200
+    assert _last_seen() is None
+
+
+def test_last_seen_skips_api_tokens(seen_app):
+    import hashlib
+
+    from flyfun_common.db.engine import SessionLocal
+    from flyfun_common.db.models import ApiTokenRow
+
+    token = "ff_lastseen-test-token"
+    s = SessionLocal()
+    try:
+        s.add(ApiTokenRow(user_id="u1", token_hash=hashlib.sha256(token.encode()).hexdigest()))
+        s.commit()
+    finally:
+        s.close()
+    resp = TestClient(seen_app).get(
+        "/protected", headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    assert _last_seen() is None

@@ -9,12 +9,15 @@ Supports three auth methods (in priority order):
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import time
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import Depends, HTTPException, Request
+from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
 from flyfun_common.auth.config import COOKIE_NAME, get_jwt_secret
@@ -22,6 +25,8 @@ from flyfun_common.auth.jwt_utils import decode_token
 from flyfun_common.auth.middleware import mark_session_authenticated
 from flyfun_common.db.engine import DEV_USER_ID, SessionLocal, is_dev_mode
 from flyfun_common.db.models import ApiTokenRow, UserRow
+
+logger = logging.getLogger(__name__)
 
 TOKEN_PREFIX = "ff_"
 _LEGACY_TOKEN_PREFIX = "wb_"  # accept old tokens during migration
@@ -273,6 +278,87 @@ def _is_session_revoked(user: UserRow, token_iat: int | None) -> bool:
     return token_iat < valid_after.timestamp()
 
 
+# ---------------------------------------------------------------------------
+# Last-seen tracking (``users.last_seen_at``)
+#
+# Stamped by ``current_user_id`` for first-party sessions (JWT cookie / Bearer
+# JWT), at most once per ``LAST_SEEN_RESOLUTION`` per user. The stamp is its
+# own conditional UPDATE on a separate connection, committed at once and never
+# raised: it holds no lock on the user row for the rest of the request (where
+# a child-row INSERT could deadlock against it), survives the request failing,
+# and a DB without the column only costs a logged failure, never an auth error.
+# Requests an app makes without the user looking (a background badge sync
+# woken by a silent push, a polling timer) are registered as *passive*.
+# ---------------------------------------------------------------------------
+LAST_SEEN_RESOLUTION = timedelta(minutes=10)
+
+_PASSIVE_PATHS: list[tuple[str, re.Pattern[str]]] = []
+# user_id -> monotonic time of the last stamp attempt in this process, so an
+# active user costs one UPDATE per resolution window, not one per request.
+_LAST_STAMP: dict[str, float] = {}
+_stamp_failure_logged = False
+
+
+def register_passive_paths(rules: list[tuple[str, str]]) -> None:
+    """Register endpoints that authenticate a user without counting as a visit.
+
+    Same ``(method, path_regex)`` shape as ``register_scope_paths`` (``"*"``
+    matches any verb, a ``GET`` rule also covers ``HEAD``, ``re.fullmatch`` on
+    ``request.url.path``). Additive — each call appends to the registry.
+    """
+    _PASSIVE_PATHS.extend((m.upper(), re.compile(p)) for m, p in rules)
+
+
+def _is_passive(request: Request) -> bool:
+    method = request.method.upper()
+    methods = {method, "GET"} if method == "HEAD" else {method}
+    path = request.url.path
+    return any(
+        (m == "*" or m in methods) and pattern.fullmatch(path)
+        for m, pattern in _PASSIVE_PATHS
+    )
+
+
+def _touch_last_seen(
+    request: Request, db: Session, user_id: str, token_iat: int | None,
+) -> None:
+    """Advance ``users.last_seen_at`` for a first-party session request.
+
+    No-op for ``ff_`` API tokens (``token_iat`` is None), passive paths, and
+    within the resolution window (checked in-process, then in SQL so another
+    process's recent stamp is respected too).
+    """
+    global _stamp_failure_logged
+    if token_iat is None or _is_passive(request):
+        return
+    mono = time.monotonic()
+    last = _LAST_STAMP.get(user_id)
+    if last is not None and mono - last < LAST_SEEN_RESOLUTION.total_seconds():
+        return
+    _LAST_STAMP[user_id] = mono
+    now = datetime.now(timezone.utc)
+    try:
+        bind = db.get_bind()
+        # A fresh connection from the request session's engine (not the
+        # session's own transaction), so the stamp commits on its own.
+        with getattr(bind, "engine", bind).begin() as conn:
+            conn.execute(
+                update(UserRow)
+                .where(
+                    UserRow.id == user_id,
+                    or_(
+                        UserRow.last_seen_at.is_(None),
+                        UserRow.last_seen_at < now - LAST_SEEN_RESOLUTION,
+                    ),
+                )
+                .values(last_seen_at=now)
+            )
+    except Exception:  # noqa: BLE001 - analytics must never fail a request
+        if not _stamp_failure_logged:
+            _stamp_failure_logged = True
+            logger.warning("users.last_seen_at stamp failed (column missing?)", exc_info=True)
+
+
 def _mark_if_session(request: Request, user_id: str, token_iat: int | None) -> None:
     """Allow SlidingSessionMiddleware to renew this request's session JWT.
 
@@ -304,6 +390,7 @@ def current_user_id(
             status_code=401, detail="Session revoked, please sign in again"
         )
 
+    _touch_last_seen(request, db, user_id, token_iat)
     _mark_if_session(request, user_id, token_iat)
     return user_id
 

@@ -133,6 +133,14 @@ Behavior:
 - Refreshing reissues a JWT with the same `sub`/`email`/`name` claims, new `iat`/`exp`, same HS256 secret. No refresh-token plumbing, no server-side denylist.
 - Suspension and "log out everywhere" take effect immediately, because the dependencies re-check `approved` and the revocation epoch on every request, and a rejected request is never renewed.
 
+### Last seen (`users.last_seen_at`, 0.6.13)
+
+`current_user_id` stamps `users.last_seen_at` for **first-party sessions only** (JWT cookie or Bearer JWT — `token_iat` set), at most once per `LAST_SEEN_RESOLUTION` (10 min) per user. `ff_` API/OAuth tokens never touch it — they have `api_tokens.last_used_at`, which the MCP server bumps on every protocol request, so it means "connector session", not "user looked". Apps register background endpoints with `register_passive_paths([(method, regex), ...])` (same shape as `register_scope_paths`, additive; a `GET` rule covers `HEAD`) so a silent-push badge sync or polling timer doesn't count as a visit. `optional_user_id` does not stamp.
+
+How it writes, and why: a conditional `UPDATE users SET last_seen_at=now WHERE id=? AND (last_seen_at IS NULL OR last_seen_at < now-10min)` on a **fresh connection** from the request session's engine, committed at once, exceptions swallowed (one warning per process). Throttled first in-process (`_LAST_STAMP`), then by the SQL guard across processes. Doing it in the request's own transaction would hold an exclusive lock on the user row until the endpoint commits — serializing a user's parallel requests and deadlocking against a child-row INSERT (FK S-lock then X-lock) — and an analytics write could 500 a real request. The column is mapped `deferred=True`, so loading a `UserRow` never selects it: an app on 0.6.13 keeps authenticating against a DB the weather migration hasn't reached yet (the stamp just fails quietly), which makes publishing order-independent.
+
+It is a last-seen value: counting users per window is exact for windows ending now (today, last 7d) and undercounts a closed past window (yesterday) by the users also seen since. A request that fails after authentication is still stamped.
+
 ## Usage Examples
 
 ```python

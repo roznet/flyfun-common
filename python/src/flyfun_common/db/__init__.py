@@ -30,6 +30,7 @@ def __getattr__(name: str):
         "find_request_scoped_db",
         "register_broad_scope",
         "register_scope_paths",
+        "register_passive_paths",
     ):
         from flyfun_common.db import deps
 
@@ -58,4 +59,5 @@ __all__ = [
     "find_request_scoped_db",
     "register_broad_scope",
     "register_scope_paths",
+    "register_passive_paths",
 ]
